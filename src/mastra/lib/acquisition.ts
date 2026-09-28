@@ -19,6 +19,7 @@ export type PinnedTransport = (request: {
   hostname: string;
   address: ResolvedAddress;
   timeoutMs: number;
+  abortSignal?: AbortSignal;
 }) => Promise<TransportResponse>;
 export type AcquiredPage = { url: string; status: number; html: string; retries: number; durationMs: number };
 
@@ -120,7 +121,7 @@ async function resolvePinned(url: URL, resolver: DnsResolver) {
   }
 }
 
-export const nodePinnedTransport: PinnedTransport = ({ url, hostname, address, timeoutMs }) =>
+export const nodePinnedTransport: PinnedTransport = ({ url, hostname, address, timeoutMs, abortSignal }) =>
   new Promise((resolve, reject) => {
     const request = (url.protocol === 'https:' ? https : http).request(
       url,
@@ -151,18 +152,29 @@ export const nodePinnedTransport: PinnedTransport = ({ url, hostname, address, t
         });
       },
     );
+    const onAbort = () => request.destroy(new AcquisitionError('ACQUISITION_CANCELED'));
+    const cleanupAbort = () => abortSignal?.removeEventListener('abort', onAbort);
     const deadline = setTimeout(() => request.destroy(new AcquisitionError('HTTP_TIMEOUT', true)), timeoutMs);
     request.setTimeout(timeoutMs, () => request.destroy(new AcquisitionError('HTTP_TIMEOUT', true)));
+    if (abortSignal?.aborted) onAbort();
+    else abortSignal?.addEventListener('abort', onAbort, { once: true });
     request.once('error', error => {
       clearTimeout(deadline);
+      cleanupAbort();
       reject(error);
     });
+    request.once('close', cleanupAbort);
     request.end();
   });
 
 export async function fetchPublicPage(
   value: string,
-  options: { resolver?: DnsResolver; transport?: PinnedTransport; acceptedContentTypes?: RegExp } = {},
+  options: {
+    resolver?: DnsResolver;
+    transport?: PinnedTransport;
+    acceptedContentTypes?: RegExp;
+    abortSignal?: AbortSignal;
+  } = {},
 ): Promise<AcquiredPage> {
   const resolver = options.resolver ?? systemResolver;
   const transport = options.transport ?? nodePinnedTransport;
@@ -175,13 +187,22 @@ export async function fetchPublicPage(
 
   let redirects = 0;
   while (redirects <= SOURCE_LIMITS.maxRedirects) {
+    if (options.abortSignal?.aborted) throw new AcquisitionError('ACQUISITION_CANCELED');
     if (Date.now() - startedAt > TIMING.acquisitionDeadlineMs) throw new AcquisitionError('ACQUISITION_TIMEOUT', true);
     if (url.hostname.toLowerCase() !== allowedHost) throw new AcquisitionError('UNSAFE_REDIRECT_HOST');
     const address = await resolvePinned(url, resolver);
+    if (options.abortSignal?.aborted) throw new AcquisitionError('ACQUISITION_CANCELED');
     let response: TransportResponse;
     try {
-      response = await transport({ url, hostname: url.hostname, address, timeoutMs: TIMING.httpAttemptMs });
+      response = await transport({
+        url,
+        hostname: url.hostname,
+        address,
+        timeoutMs: TIMING.httpAttemptMs,
+        abortSignal: options.abortSignal,
+      });
     } catch (error) {
+      if (options.abortSignal?.aborted) throw new AcquisitionError('ACQUISITION_CANCELED');
       if (retries >= TIMING.maxRetries || (error instanceof AcquisitionError && !error.retryable)) throw error;
       retries += 1;
       const wait = Math.min(
@@ -193,6 +214,7 @@ export async function fetchPublicPage(
       await new Promise(resolve => setTimeout(resolve, wait));
       continue;
     }
+    if (options.abortSignal?.aborted) throw new AcquisitionError('ACQUISITION_CANCELED');
     if ((HTTP_STATUS.redirects as readonly number[]).includes(response.status)) {
       const location = header(response, 'location');
       if (!location) throw new AcquisitionError('REDIRECT_WITHOUT_LOCATION');
@@ -230,7 +252,7 @@ export async function fetchPublicPage(
 
 export async function assertRobotsAllowed(
   pageUrl: string,
-  options: { resolver?: DnsResolver; transport?: PinnedTransport } = {},
+  options: { resolver?: DnsResolver; transport?: PinnedTransport; abortSignal?: AbortSignal } = {},
 ) {
   const url = new URL(pageUrl);
   const robotsUrl = new URL('/robots.txt', url).toString();
