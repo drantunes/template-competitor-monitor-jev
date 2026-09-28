@@ -1,0 +1,12 @@
+node_modules/
+.mastra/
+.data/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+*.log
+.DS_Store
