@@ -14,10 +14,7 @@ import type { DnsResolver, PinnedTransport } from '../src/mastra/lib/acquisition
 import { diffContent, normalizeHtml } from '../src/mastra/lib/content';
 import { MonitorStore } from '../src/mastra/lib/store';
 import { monitorInputSchema } from '../src/mastra/schemas';
-import {
-  createCompetitorMonitorWorkflow,
-  runCompetitorMonitor,
-} from '../src/mastra/workflows/competitor-monitor-workflow';
+import { createCompetitorMonitorWorkflow } from '../src/mastra/workflows/competitor-monitor-workflow';
 
 const publicDns: DnsResolver = async () => [{ address: '93.184.216.34', family: 4 }];
 const html = (price: string) =>
@@ -400,19 +397,9 @@ describe('native workflow and durable application store', () => {
     let page = html('$19');
     const store = MonitorStore.open(url);
     stores.push(store);
-    await runCompetitorMonitor(sourceInput(), {
-      store,
-      config,
-      resolver: publicDns,
-      transport: fixtureTransport(() => page),
-    });
+    await runRegisteredWorkflow(store, config, () => page);
     page = html('$29');
-    const changed = await runCompetitorMonitor(sourceInput(), {
-      store,
-      config,
-      resolver: publicDns,
-      transport: fixtureTransport(() => page),
-    });
+    const changed = await runRegisteredWorkflow(store, config, () => page);
     expect(changed).toMatchObject({ status: 'partial', counts: { candidatesDetected: 1, candidatesDeferred: 1 } });
     expect(await store.pendingForRun(changed.runId)).toHaveLength(1);
   });
@@ -532,6 +519,55 @@ describe('native workflow and durable application store', () => {
     expect(first.monitorId).toBe('one');
     expect(second.monitorId).toBe('two');
     await Promise.all([store.finishRun(first, 'success', {}), store.finishRun(second, 'success', {})]);
+  });
+
+  it('preserves a live lock across local store handles and recovers it after every handle closes', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'competitor-monitor-live-lock-'));
+    const url = `file:${join(directory, 'monitor.db')}`;
+    const first = MonitorStore.open(url);
+    stores.push(first);
+    const active = await first.beginRun('monitor-a');
+    const second = MonitorStore.open(new URL(url).href);
+    stores.push(second);
+    await second.init();
+    await expect(second.beginRun('monitor-a')).rejects.toThrow('MONITOR_BUSY');
+    const current = await second.client.execute({
+      sql: 'SELECT status FROM monitor_runs WHERE id = ?',
+      args: [active.id],
+    });
+    expect(current.rows[0]?.status).toBe('running');
+    await first.close();
+    await second.close();
+    stores = stores.filter(store => store !== first && store !== second);
+    const reopened = MonitorStore.open(url);
+    stores.push(reopened);
+    const recovered = await reopened.beginRun('monitor-a');
+    expect(recovered.id).not.toBe(active.id);
+    const previous = await reopened.client.execute({
+      sql: 'SELECT status FROM monitor_runs WHERE id = ?',
+      args: [active.id],
+    });
+    expect(previous.rows[0]?.status).toBe('partial');
+    await reopened.finishRun(recovered, 'success', {});
+  });
+
+  it('does not reserve provider budget when the registered classifier is absent', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'competitor-monitor-missing-classifier-'));
+    const config = loadConfig({
+      MONITOR_DATABASE_URL: `file:${join(directory, 'monitor.db')}`,
+      MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
+      TYPESAFE_AI_API_KEY: 'synthetic-key',
+      JEV_MODEL: 'jev-fixture',
+      JEV_COST_ATTESTATION: 'typesafe-jev-2026-09-27:jev-fixture',
+    });
+    const store = MonitorStore.open(config.storage.monitorUrl);
+    stores.push(store);
+    await runRegisteredWorkflow(store, config, () => html('$19'));
+    const changed = await runRegisteredWorkflow(store, config, () => html('$29'));
+    expect(changed.changes).toEqual([
+      expect.objectContaining({ status: 'failed', reason: 'CLASSIFICATION_PROVIDER_FAILURE' }),
+    ]);
+    expect(await store.reservedProviderUsd('jev')).toBe(0);
   });
 
   it('adds optional acquisition metadata without rewriting an existing snapshot JSON record', async () => {
@@ -704,15 +740,12 @@ describe('native workflow and durable application store', () => {
       transportCalls += 1;
       return html('$19');
     });
-    await runCompetitorMonitor(sourceInput(), { store, config, resolver: publicDns, transport });
-    const limited = await runCompetitorMonitor(
+    await runRegisteredWorkflow(store, config, () => html('$19'), sourceInput(), transport);
+    const limited = await runRegisteredWorkflow(
+      store,
+      config,
+      () => html('$29').replace('</main>', '<p>New entitlement.</p></main>'),
       { ...sourceInput(), policy: { maxCandidatesPerSource: 1 } },
-      {
-        store,
-        config,
-        resolver: publicDns,
-        transport: fixtureTransport(() => html('$29').replace('</main>', '<p>New entitlement.</p></main>')),
-      },
     );
     expect(limited).toMatchObject({
       status: 'partial',
@@ -724,22 +757,34 @@ describe('native workflow and durable application store', () => {
       status: 'pending',
       detail: { warnings: ['CANDIDATE_LIMIT'] },
     });
-    await expect(
-      runCompetitorMonitor(sourceInput(sources.slice(0, 2)), { store, config, resolver: publicDns, transport }),
-    ).rejects.toThrow('SOURCE_LIMIT_EXCEEDED');
+    const tooManySources = await startRegisteredWorkflow(
+      store,
+      config,
+      () => html('$19'),
+      sourceInput(sources.slice(0, 2)),
+      transport,
+    );
+    expect(tooManySources.status).toBe('failed');
+    expect(JSON.stringify(tooManySources)).toContain('SOURCE_LIMIT_EXCEEDED');
     expect(transportCalls).toBeGreaterThan(0);
-    await expect(
-      runCompetitorMonitor(
-        { ...sourceInput(), policy: { sourceConcurrency: 2 } },
-        { store, config, resolver: publicDns, transport },
-      ),
-    ).rejects.toThrow('EFFECTIVE_CONCURRENCY_EXCEEDED');
-    await expect(
-      runCompetitorMonitor(
-        { ...sourceInput(), policy: { maxCandidatesPerSource: 2 } },
-        { store, config, resolver: publicDns, transport },
-      ),
-    ).rejects.toThrow('EFFECTIVE_CANDIDATE_LIMIT_EXCEEDED');
+    const tooMuchConcurrency = await startRegisteredWorkflow(
+      store,
+      config,
+      () => html('$19'),
+      { ...sourceInput(), policy: { sourceConcurrency: 2 } },
+      transport,
+    );
+    expect(tooMuchConcurrency.status).toBe('failed');
+    expect(JSON.stringify(tooMuchConcurrency)).toContain('EFFECTIVE_CONCURRENCY_EXCEEDED');
+    const tooManyCandidates = await startRegisteredWorkflow(
+      store,
+      config,
+      () => html('$19'),
+      { ...sourceInput(), policy: { maxCandidatesPerSource: 2 } },
+      transport,
+    );
+    expect(tooManyCandidates.status).toBe('failed');
+    expect(JSON.stringify(tooManyCandidates)).toContain('EFFECTIVE_CANDIDATE_LIMIT_EXCEEDED');
     expect(() => loadConfig({ SOURCE_CONCURRENCY: '6' })).toThrow('SOURCE_CONCURRENCY');
     expect(() => loadConfig({ CANDIDATES_PER_SOURCE: '51' })).toThrow('CANDIDATES_PER_SOURCE');
   });

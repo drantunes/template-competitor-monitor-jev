@@ -2,25 +2,12 @@ import { z } from 'zod';
 
 import { INPUT_LIMITS, POLICY_DEFAULTS, RUBRIC, SOURCE_LIMITS } from './config';
 
-export const interestSchema = z.enum([
-  'pricing',
-  'packaging',
-  'product_feature',
-  'availability',
-  'deprecation',
-  'policy_terms',
-  'security_compliance',
-  'documentation',
-  'company_announcement',
-]);
+// Shared identifier boundary for persisted monitor and source identities.
+const identifier = z.string().trim().min(1).max(INPUT_LIMITS.maxIdentifierChars);
 
+// Public source configuration and URL normalization used by acquisition and deduplication.
 export const sourceKindSchema = z.enum(['pricing', 'changelog', 'documentation', 'blog', 'status', 'other']);
 export const fetchModeSchema = z.enum(['auto', 'http', 'browser']);
-export const runModeSchema = z.enum(['baseline', 'manual', 'scheduled']).default('manual');
-
-const boundedProbability = z.number().finite().min(RUBRIC.minProbability).max(RUBRIC.maxProbability);
-const boundedScore = z.number().finite().min(RUBRIC.minScore).max(RUBRIC.maxScore);
-const identifier = z.string().trim().min(1).max(INPUT_LIMITS.maxIdentifierChars);
 
 export const sourceSchema = z
   .object({
@@ -36,6 +23,37 @@ export const sourceSchema = z
       .default([]),
   })
   .strict();
+
+export type MonitorSource = z.infer<typeof sourceSchema>;
+
+export function normalizedSourceUrl(value: string) {
+  const url = new URL(value);
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('UNSAFE_URL_SCHEME');
+  if (url.username || url.password) throw new Error('UNSAFE_URL_CREDENTIALS');
+  url.hash = '';
+  url.hostname = url.hostname.toLowerCase();
+  if ((url.protocol === 'http:' && url.port === '80') || (url.protocol === 'https:' && url.port === '443'))
+    url.port = '';
+  return url.toString();
+}
+
+// Monitor profile, routing policy, and run options supplied by an operator.
+export const interestSchema = z.enum([
+  'pricing',
+  'packaging',
+  'product_feature',
+  'availability',
+  'deprecation',
+  'policy_terms',
+  'security_compliance',
+  'documentation',
+  'company_announcement',
+]);
+
+export const runModeSchema = z.enum(['baseline', 'manual', 'scheduled']).default('manual');
+
+const boundedProbability = z.number().finite().min(RUBRIC.minProbability).max(RUBRIC.maxProbability);
+const boundedScore = z.number().finite().min(RUBRIC.minScore).max(RUBRIC.maxScore);
 
 export const monitorInputSchema = z
   .object({
@@ -81,19 +99,8 @@ export const monitorInputSchema = z
   .strict();
 
 export type MonitorInput = z.infer<typeof monitorInputSchema>;
-export type MonitorSource = z.infer<typeof sourceSchema>;
 
-export function normalizedSourceUrl(value: string) {
-  const url = new URL(value);
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('UNSAFE_URL_SCHEME');
-  if (url.username || url.password) throw new Error('UNSAFE_URL_CREDENTIALS');
-  url.hash = '';
-  url.hostname = url.hostname.toLowerCase();
-  if ((url.protocol === 'http:' && url.port === '80') || (url.protocol === 'https:' && url.port === '443'))
-    url.port = '';
-  return url.toString();
-}
-
+// Validate cross-source identities after schema parsing and collapse equivalent URLs.
 export function validateMonitorInput(value: unknown): MonitorInput {
   const input = monitorInputSchema.parse(value);
   const sourceIds = new Set<string>();

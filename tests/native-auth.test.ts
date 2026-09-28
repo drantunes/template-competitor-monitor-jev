@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadConfig } from '../src/mastra/config';
 import { normalizeHtml } from '../src/mastra/lib/content';
 
-type Runtime = ReturnType<typeof import('../src/mastra/index').createMastraRuntime>;
+type Runtime = ReturnType<typeof import('../src/mastra/bootstrap').initializeRuntime>;
 const runtimes: Runtime[] = [];
 afterEach(async () => {
   await Promise.all(
@@ -21,20 +21,17 @@ afterEach(async () => {
 
 async function productionApp(token: string) {
   const directory = await mkdtemp(join(tmpdir(), 'competitor-monitor-auth-'));
-  // The module exports a default server instance, so isolate its import-time databases first.
-  vi.stubEnv('MASTRA_DATABASE_URL', `file:${join(directory, 'import-mastra.db')}`);
-  vi.stubEnv('MONITOR_DATABASE_URL', `file:${join(directory, 'import-monitor.db')}`);
-  vi.stubEnv('EXECUTION_MODE', 'local');
-  const { createMastraRuntime, runtime: importedRuntime } = await import('../src/mastra/index');
-  if (!runtimes.includes(importedRuntime)) runtimes.push(importedRuntime);
-  const runtime = createMastraRuntime({
-    EXECUTION_MODE: 'production',
-    MASTRA_API_TOKEN: token,
-    MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
-    MONITOR_DATABASE_URL: `file:${join(directory, 'monitor.db')}`,
-  });
-  runtimes.push(runtime);
-  return createHonoServer(runtime.mastra);
+  // Reload the production entry point with this server's own configuration.
+  vi.stubEnv('MASTRA_DATABASE_URL', `file:${join(directory, 'mastra.db')}`);
+  vi.stubEnv('MONITOR_DATABASE_URL', `file:${join(directory, 'monitor.db')}`);
+  vi.stubEnv('EXECUTION_MODE', 'production');
+  vi.stubEnv('MASTRA_API_TOKEN', token);
+  vi.resetModules();
+  const { mastra } = await import('../src/mastra/index');
+  const { bootstrap } = await import('../src/mastra/bootstrap');
+  expect(mastra.getClassifierById('competitor-change-classifier')).toBeDefined();
+  runtimes.push(bootstrap);
+  return createHonoServer(mastra);
 }
 
 describe('native Mastra SimpleAuth', () => {
@@ -52,7 +49,8 @@ describe('native Mastra SimpleAuth', () => {
     vi.stubEnv('MASTRA_DATABASE_URL', undefined);
     vi.stubEnv('MONITOR_DATABASE_URL', undefined);
     const currentDirectory = vi.spyOn(process, 'cwd').mockReturnValue(outputDirectory);
-    const { createMastraRuntime, runtime: first } = await import('../src/mastra/index');
+    await import('../src/mastra/index');
+    const { bootstrap: first, initializeRuntime } = await import('../src/mastra/bootstrap');
     runtimes.push(first);
     await first.frameworkStore.init();
     const run = await first.applicationStore.beginRun('durable-monitor');
@@ -90,14 +88,14 @@ describe('native Mastra SimpleAuth', () => {
     const startPaths = loadConfig({ MASTRA_PROJECT_ROOT: projectRoot }).storage;
     expect(startPaths).toEqual(devPaths);
     expect(loadConfig({}).storage).toEqual(startPaths);
-    const reopened = createMastraRuntime({});
+    const reopened = initializeRuntime({});
     runtimes.push(reopened);
     await reopened.frameworkStore.init();
     expect((await reopened.applicationStore.baseline('durable-monitor', 'pricing'))?.id).toBe(snapshot.id);
     await access(join(projectRoot, '.data', 'mastra.db'));
     await access(join(projectRoot, '.data', 'competitor-monitor.db'));
     const custom = loadConfig({ MASTRA_PROJECT_ROOT: projectRoot, MONITOR_DATABASE_URL: 'file:./custom/history.db' });
-    const overridden = createMastraRuntime({
+    const overridden = initializeRuntime({
       MASTRA_PROJECT_ROOT: projectRoot,
       MONITOR_DATABASE_URL: 'file:./custom/history.db',
     });

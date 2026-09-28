@@ -5,7 +5,8 @@ import { fileURLToPath } from 'node:url';
 
 import { createClient, type Client } from '@libsql/client';
 
-import { resolveDatabaseUrl } from '../config';
+import { CLASSIFICATION_LIMITS, resolveDatabaseUrl } from '../config';
+import type { ClassificationDecision } from './classification';
 import type { Evidence, NormalizedContent } from './content';
 
 /** Prepare local directories only; remote and in-memory URLs do not touch the filesystem. */
@@ -40,15 +41,39 @@ export type StoredRun = {
   startedAt: string;
 };
 
+export type PendingCandidate = Evidence & {
+  candidateId: string;
+  monitorId: string;
+  sourceId: string;
+  beforeSnapshotId: string;
+  afterSnapshotId: string;
+};
+
+// Startup recovery belongs to the local database, not to each client handle in this process.
+const localDatabaseOwners = new Map<string, { owners: Set<MonitorStore>; recovery?: Promise<void> }>();
+
 export class MonitorStore {
   private initialized = false;
   private initializing?: Promise<void>;
 
-  constructor(readonly client: Client) {}
+  private constructor(
+    readonly client: Client,
+    private readonly localDatabasePath?: string,
+  ) {}
 
   static open(url: string) {
     ensureDatabaseDirectory(url);
-    return new MonitorStore(createClient({ url }));
+    const localDatabasePath =
+      url.startsWith('file:') && url !== 'file::memory:'
+        ? fileURLToPath(resolveDatabaseUrl(url, process.cwd()))
+        : undefined;
+    const store = new MonitorStore(createClient({ url }), localDatabasePath);
+    if (localDatabasePath) {
+      const entry = localDatabaseOwners.get(localDatabasePath) ?? { owners: new Set<MonitorStore>() };
+      entry.owners.add(store);
+      localDatabaseOwners.set(localDatabasePath, entry);
+    }
+    return store;
   }
 
   async init() {
@@ -114,6 +139,25 @@ export class MonitorStore {
         detail_json TEXT NOT NULL,
         PRIMARY KEY (run_id, source_id)
       );
+      CREATE TABLE IF NOT EXISTS classification_decisions (
+        candidate_id TEXT NOT NULL,
+        question_set_version TEXT NOT NULL,
+        rule_version TEXT NOT NULL,
+        decision_json TEXT NOT NULL,
+        audit_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (candidate_id, question_set_version, rule_version)
+      );
+      CREATE TABLE IF NOT EXISTS provider_reservations (
+        id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        candidate_id TEXT NOT NULL,
+        amount_units INTEGER NOT NULL,
+        known_amount_units INTEGER,
+        unresolved_units INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
     `);
     // Older F1 databases store only normalized content. Keep those immutable rows readable and add
     // optional metadata for new snapshots instead of rebuilding or rewriting the table.
@@ -121,6 +165,22 @@ export class MonitorStore {
     if (!snapshotColumns.rows.some(row => String(row.name) === 'acquisition_json')) {
       await this.client.execute('ALTER TABLE snapshots ADD COLUMN acquisition_json TEXT');
     }
+    const entry = this.localDatabasePath ? localDatabaseOwners.get(this.localDatabasePath) : undefined;
+    if (entry) {
+      if (!entry.recovery) {
+        const recovery = this.recoverInterruptedRuns();
+        entry.recovery = recovery;
+        void recovery.catch(() => {
+          if (entry.recovery === recovery) entry.recovery = undefined;
+        });
+      }
+      await entry.recovery;
+    } else {
+      await this.recoverInterruptedRuns();
+    }
+  }
+
+  private async recoverInterruptedRuns() {
     await this.client.batch(
       [
         {
@@ -158,7 +218,7 @@ export class MonitorStore {
     await this.client.batch(
       [
         {
-          sql: 'UPDATE monitor_runs SET status = ?, completed_at = ?, result_json = ? WHERE id = ?',
+          sql: "UPDATE monitor_runs SET status = ?, completed_at = ?, result_json = ? WHERE id = ? AND status = 'running'",
           args: [status, new Date().toISOString(), JSON.stringify(result), run.id],
         },
         { sql: 'DELETE FROM monitor_locks WHERE monitor_id = ? AND run_id = ?', args: [run.monitorId, run.id] },
@@ -210,10 +270,11 @@ export class MonitorStore {
       acquisition: input.acquisition,
       createdAt: new Date().toISOString(),
     };
+    const runIsActive = "EXISTS (SELECT 1 FROM monitor_runs WHERE id = ? AND status = 'running')";
     const statements = [
       {
         sql: `INSERT INTO monitor_sources (monitor_id, source_id, source_url, normalization_profile, baseline_snapshot_id)
-              VALUES (?, ?, ?, ?, ?)
+              SELECT ?, ?, ?, ?, ? WHERE ${runIsActive}
               ON CONFLICT(monitor_id, source_id) DO UPDATE SET baseline_snapshot_id = excluded.baseline_snapshot_id`,
         args: [
           input.monitorId,
@@ -221,12 +282,13 @@ export class MonitorStore {
           input.sourceUrl,
           input.normalizationProfile,
           input.promoteBaseline ? snapshot.id : (input.beforeSnapshot?.id ?? null),
+          input.runId,
         ],
       },
       {
         sql: `INSERT INTO snapshots
               (id, monitor_id, source_id, source_url, content_json, content_hash, acquisition_json, created_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+              SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE ${runIsActive}`,
         args: [
           snapshot.id,
           snapshot.monitorId,
@@ -236,6 +298,7 @@ export class MonitorStore {
           snapshot.content.hash,
           snapshot.acquisition ? JSON.stringify(snapshot.acquisition) : null,
           snapshot.createdAt,
+          input.runId,
         ],
       },
       ...input.evidence.map(item => {
@@ -243,7 +306,7 @@ export class MonitorStore {
         return {
           sql: `INSERT OR IGNORE INTO pending_evidence
               (id, run_id, monitor_id, source_id, before_snapshot_id, after_snapshot_id, evidence_json, status)
-              VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
+              SELECT ?, ?, ?, ?, ?, ?, ?, 'pending' WHERE ${runIsActive}`,
           args: [
             candidateId,
             input.runId,
@@ -252,20 +315,24 @@ export class MonitorStore {
             input.beforeSnapshot!.id,
             snapshot.id,
             JSON.stringify({ ...item, id: candidateId }),
+            input.runId,
           ],
         };
       }),
       {
-        sql: 'INSERT OR REPLACE INTO source_outcomes (run_id, source_id, status, detail_json) VALUES (?, ?, ?, ?)',
+        sql: `INSERT OR REPLACE INTO source_outcomes (run_id, source_id, status, detail_json)
+              SELECT ?, ?, ?, ? WHERE ${runIsActive}`,
         args: [
           input.runId,
           input.sourceId,
           input.evidence.length ? 'pending' : 'accepted',
           JSON.stringify({ snapshotId: snapshot.id, warnings: input.warnings ?? [] }),
+          input.runId,
         ],
       },
     ];
-    await this.client.batch(statements, 'write');
+    const results = await this.client.batch(statements, 'write');
+    if (!results[1]?.rowsAffected) throw new Error('RUN_CANCELED');
     return snapshot;
   }
 
@@ -290,12 +357,13 @@ export class MonitorStore {
       acquisition: input.acquisition,
       createdAt: new Date().toISOString(),
     };
-    await this.client.batch(
+    const runIsActive = "EXISTS (SELECT 1 FROM monitor_runs WHERE id = ? AND status = 'running')";
+    const results = await this.client.batch(
       [
         {
           sql: `INSERT INTO snapshots
                 (id, monitor_id, source_id, source_url, content_json, content_hash, acquisition_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE ${runIsActive}`,
           args: [
             snapshot.id,
             snapshot.monitorId,
@@ -305,20 +373,24 @@ export class MonitorStore {
             snapshot.content.hash,
             JSON.stringify(snapshot.acquisition),
             snapshot.createdAt,
+            input.runId,
           ],
         },
         {
-          sql: 'INSERT OR REPLACE INTO source_outcomes (run_id, source_id, status, detail_json) VALUES (?, ?, ?, ?)',
+          sql: `INSERT OR REPLACE INTO source_outcomes (run_id, source_id, status, detail_json)
+                SELECT ?, ?, ?, ? WHERE ${runIsActive}`,
           args: [
             input.runId,
             input.sourceId,
             'quarantined',
             JSON.stringify({ code: input.code, snapshotId: snapshot.id, reason: input.reason }),
+            input.runId,
           ],
         },
       ],
       'write',
     );
+    if (!results[0]?.rowsAffected) throw new Error('RUN_CANCELED');
     return snapshot;
   }
 
@@ -336,6 +408,124 @@ export class MonitorStore {
       args: [monitorId, sourceId, 'pending'],
     });
     return result.rows.map(row => String(row.id));
+  }
+
+  async pendingCandidatesForSource(monitorId: string, sourceId: string): Promise<PendingCandidate[]> {
+    await this.init();
+    const result = await this.client.execute({
+      sql: `SELECT id, monitor_id, source_id, before_snapshot_id, after_snapshot_id, evidence_json
+            FROM pending_evidence WHERE monitor_id = ? AND source_id = ? AND status = 'pending' ORDER BY id`,
+      args: [monitorId, sourceId],
+    });
+    return result.rows.map(row => ({
+      ...(JSON.parse(String(row.evidence_json)) as Evidence),
+      candidateId: String(row.id),
+      monitorId: String(row.monitor_id),
+      sourceId: String(row.source_id),
+      beforeSnapshotId: String(row.before_snapshot_id),
+      afterSnapshotId: String(row.after_snapshot_id),
+    }));
+  }
+
+  /** Atomically reserves the full bounded native-call allowance. Reservations remain on uncertain billing. */
+  async reserveProviderBudget(input: { provider: 'jev'; candidateId: string; amountUsd: number; ceilingUsd: number }) {
+    await this.init();
+    const id = randomUUID();
+    const amountUnits = Math.ceil(input.amountUsd * CLASSIFICATION_LIMITS.usdReservationUnits);
+    const ceilingUnits = Math.floor(input.ceilingUsd * CLASSIFICATION_LIMITS.usdReservationUnits);
+    const result = await this.client.execute({
+      sql: `INSERT INTO provider_reservations (id, provider, candidate_id, amount_units, unresolved_units, status, created_at)
+            SELECT ?, ?, ?, ?, ?, 'uncertain', ?
+            WHERE COALESCE((SELECT SUM(COALESCE(known_amount_units + unresolved_units, amount_units)) FROM provider_reservations WHERE provider = ?), 0) + ? <= ?`,
+      args: [
+        id,
+        input.provider,
+        input.candidateId,
+        amountUnits,
+        amountUnits,
+        new Date().toISOString(),
+        input.provider,
+        amountUnits,
+        ceilingUnits,
+      ],
+    });
+    return result.rowsAffected > 0 ? id : undefined;
+  }
+
+  /** Release only a reservation made before an evaluation was dispatched. Attempted calls remain uncertain. */
+  async releaseUnattemptedProviderReservation(id: string) {
+    await this.client.execute({
+      sql: `DELETE FROM provider_reservations
+            WHERE id = ? AND status = 'uncertain' AND known_amount_units IS NULL AND unresolved_units = amount_units`,
+      args: [id],
+    });
+  }
+
+  async commitClassification(input: {
+    candidateId: string;
+    questionSetVersion: string;
+    decision: ClassificationDecision;
+    audit: Record<string, unknown>;
+    reservationId?: string;
+    knownUsageUsd?: number;
+    unresolvedUsageUsd?: number;
+  }) {
+    await this.init();
+    const settlement =
+      input.reservationId && input.knownUsageUsd !== undefined && input.unresolvedUsageUsd !== undefined
+        ? [
+            {
+              sql: 'UPDATE provider_reservations SET known_amount_units = ?, unresolved_units = ? WHERE id = ?',
+              args: [
+                Math.ceil(input.knownUsageUsd * CLASSIFICATION_LIMITS.usdReservationUnits),
+                Math.ceil(input.unresolvedUsageUsd * CLASSIFICATION_LIMITS.usdReservationUnits),
+                input.reservationId,
+              ],
+            },
+          ]
+        : [];
+    await this.client.batch(
+      [
+        {
+          sql: `INSERT OR IGNORE INTO classification_decisions
+                (candidate_id, question_set_version, rule_version, decision_json, audit_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)`,
+          args: [
+            input.candidateId,
+            input.questionSetVersion,
+            input.decision.ruleVersion,
+            JSON.stringify(input.decision),
+            JSON.stringify(input.audit),
+            new Date().toISOString(),
+          ],
+        },
+        { sql: "UPDATE pending_evidence SET status = 'classified' WHERE id = ?", args: [input.candidateId] },
+        ...settlement,
+      ],
+      'write',
+    );
+  }
+
+  async classification(candidateId: string) {
+    const result = await this.client.execute({
+      sql: 'SELECT decision_json, audit_json FROM classification_decisions WHERE candidate_id = ?',
+      args: [candidateId],
+    });
+    const row = result.rows[0];
+    return row
+      ? {
+          decision: JSON.parse(String(row.decision_json)) as ClassificationDecision,
+          audit: JSON.parse(String(row.audit_json)),
+        }
+      : undefined;
+  }
+
+  async reservedProviderUsd(provider: 'jev') {
+    const result = await this.client.execute({
+      sql: 'SELECT COALESCE(SUM(COALESCE(known_amount_units + unresolved_units, amount_units)), 0) AS amount FROM provider_reservations WHERE provider = ?',
+      args: [provider],
+    });
+    return Number(result.rows[0]?.amount ?? 0) / CLASSIFICATION_LIMITS.usdReservationUnits;
   }
 
   async pendingWarningsForSource(monitorId: string, sourceId: string): Promise<string[]> {
@@ -362,13 +552,20 @@ export class MonitorStore {
     detail: unknown,
   ) {
     await this.client.execute({
-      sql: 'INSERT OR REPLACE INTO source_outcomes (run_id, source_id, status, detail_json) VALUES (?, ?, ?, ?)',
-      args: [runId, sourceId, status, JSON.stringify(detail)],
+      sql: `INSERT OR REPLACE INTO source_outcomes (run_id, source_id, status, detail_json)
+            SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM monitor_runs WHERE id = ? AND status = 'running')`,
+      args: [runId, sourceId, status, JSON.stringify(detail), runId],
     });
   }
 
   async close() {
+    await this.initializing?.catch(() => {});
     this.client.close();
+    if (this.localDatabasePath) {
+      const entry = localDatabaseOwners.get(this.localDatabasePath);
+      entry?.owners.delete(this);
+      if (entry?.owners.size === 0) localDatabaseOwners.delete(this.localDatabasePath);
+    }
   }
 
   private rowToSnapshot(row: Record<string, unknown>): Snapshot {
