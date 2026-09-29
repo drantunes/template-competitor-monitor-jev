@@ -389,7 +389,8 @@ describe('auditable classifier policy', () => {
       });
       expect(decision?.audit).not.toHaveProperty('verifiedModel');
       expect(exportedSpans.some(span => span.spanType === 'classifier_evaluation')).toBe(true);
-      const exported = JSON.stringify({ spans: exportedSpans, result });
+      // Public report evidence is intentionally returned to the operator. This check covers telemetry export only.
+      const exported = JSON.stringify({ spans: exportedSpans });
       expect(exported).not.toContain('synthetic-key-CANARY-DO-NOT-EXPORT');
       expect(exported).not.toContain('RAW_HEADER_CANARY_DO_NOT_EXPORT');
       expect(exported).not.toContain(fullPageCanary);
@@ -779,7 +780,11 @@ describe('auditable classifier policy', () => {
           questions: COMPETITOR_CHANGE_QUESTIONS,
         }),
       );
-      expect(recovered).toMatchObject({ status: 'success', counts: { candidatesClassified: 1 } });
+      expect(recovered).toMatchObject({
+        status: 'partial',
+        counts: { candidatesClassified: 1 },
+        report: { summaryFailure: 'COST_UNVERIFIED' },
+      });
       expect(await reopened.pendingCandidatesForSource('classification-monitor', 'pricing')).toHaveLength(0);
       const repeated = await monitoredWorkflow(
         reopened,

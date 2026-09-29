@@ -65,6 +65,9 @@ const environmentSchema = z
     TYPESAFE_AI_API_KEY: z.string().trim().min(1).optional(),
     // Operator confirms this exact configured model/account uses the published bounded Jev tariff before a paid call.
     JEV_COST_ATTESTATION: z.string().trim().min(1).optional(),
+    OPENAI_API_KEY: z.string().trim().min(1).optional(),
+    // The operator verifies model access and the current published tariff before an OpenAI request.
+    OPENAI_COST_ATTESTATION: z.string().trim().min(1).optional(),
     MASTRA_DATABASE_URL: z.string().trim().min(1).default(STORAGE_DEFAULTS.mastraUrl),
     MONITOR_DATABASE_URL: z.string().trim().min(1).default(STORAGE_DEFAULTS.monitorUrl),
     MASTRA_PROJECT_ROOT: z.string().trim().min(1).optional(),
@@ -102,8 +105,11 @@ export function loadConfig(environment: Readonly<Record<string, string | undefin
       candidatesPerSource: env.CANDIDATES_PER_SOURCE,
     },
     models: { ...MODEL_DEFAULTS, jev: env.JEV_MODEL },
-    credentials: { jevApiKey: env.TYPESAFE_AI_API_KEY },
-    billing: { jevCostAttested: env.JEV_COST_ATTESTATION === `typesafe-jev-2026-09-27:${env.JEV_MODEL}` },
+    credentials: { jevApiKey: env.TYPESAFE_AI_API_KEY, openaiApiKey: env.OPENAI_API_KEY },
+    billing: {
+      jevCostAttested: env.JEV_COST_ATTESTATION === `typesafe-jev-2026-09-27:${env.JEV_MODEL}`,
+      openaiCostAttested: env.OPENAI_COST_ATTESTATION === `openai-gpt-6-luna-2026-09-29:${MODEL_DEFAULTS.summary}`,
+    },
     budgetUsd: { jev: env.JEV_BUDGET_USD, openai: env.OPENAI_BUDGET_USD },
     storage: {
       mastraUrl: resolveDatabaseUrl(env.MASTRA_DATABASE_URL, projectRoot),

@@ -184,6 +184,7 @@ describe('native workflow and durable application store', () => {
     const existingBaseline = await runRegisteredWorkflow(reopened, config, () => normalizedEquivalent, {
       ...sourceInput(),
       runMode: 'baseline',
+      options: { includeUnchangedSources: true },
     });
     expect(existingBaseline.sources).toEqual([
       expect.objectContaining({ sourceId: 'pricing-page', status: 'unchanged', outcome: 'BASELINE_ALREADY_EXISTS' }),

@@ -40,6 +40,7 @@ export type StoredRun = {
   monitorId: string;
   status: 'running' | 'success' | 'partial' | 'failed';
   startedAt: string;
+  nativeWorkflowRunId?: string;
 };
 
 export type PendingCandidate = Evidence & {
@@ -126,6 +127,7 @@ export class MonitorStore {
         monitor_id TEXT NOT NULL,
         status TEXT NOT NULL,
         started_at TEXT NOT NULL,
+        native_workflow_run_id TEXT,
         completed_at TEXT,
         result_json TEXT
       );
@@ -166,6 +168,10 @@ export class MonitorStore {
     if (!snapshotColumns.rows.some(row => String(row.name) === 'acquisition_json')) {
       await this.client.execute('ALTER TABLE snapshots ADD COLUMN acquisition_json TEXT');
     }
+    const runColumns = await this.client.execute('PRAGMA table_info(monitor_runs)');
+    if (!runColumns.rows.some(row => String(row.name) === 'native_workflow_run_id')) {
+      await this.client.execute('ALTER TABLE monitor_runs ADD COLUMN native_workflow_run_id TEXT');
+    }
     const entry = this.localDatabasePath ? localDatabaseOwners.get(this.localDatabasePath) : undefined;
     if (entry) {
       if (!entry.recovery) {
@@ -194,15 +200,21 @@ export class MonitorStore {
     );
   }
 
-  async beginRun(monitorId: string): Promise<StoredRun> {
+  async beginRun(monitorId: string, nativeWorkflowRunId?: string): Promise<StoredRun> {
     await this.init();
-    const run = { id: randomUUID(), monitorId, status: 'running' as const, startedAt: new Date().toISOString() };
+    const run = {
+      id: randomUUID(),
+      monitorId,
+      status: 'running' as const,
+      startedAt: new Date().toISOString(),
+      nativeWorkflowRunId,
+    };
     try {
       await this.client.batch(
         [
           {
-            sql: 'INSERT INTO monitor_runs (id, monitor_id, status, started_at) VALUES (?, ?, ?, ?)',
-            args: [run.id, run.monitorId, run.status, run.startedAt],
+            sql: 'INSERT INTO monitor_runs (id, monitor_id, status, started_at, native_workflow_run_id) VALUES (?, ?, ?, ?, ?)',
+            args: [run.id, run.monitorId, run.status, run.startedAt, run.nativeWorkflowRunId ?? null],
           },
           { sql: 'INSERT INTO monitor_locks (monitor_id, run_id) VALUES (?, ?)', args: [monitorId, run.id] },
         ],
@@ -226,6 +238,26 @@ export class MonitorStore {
       ],
       'write',
     );
+  }
+
+  /** Operator-safe join key for native schedule trigger history. */
+  async runForNativeWorkflowRunId(nativeWorkflowRunId: string) {
+    await this.init();
+    const result = await this.client.execute({
+      sql: `SELECT id, monitor_id, status, started_at, completed_at
+            FROM monitor_runs WHERE native_workflow_run_id = ?`,
+      args: [nativeWorkflowRunId],
+    });
+    const row = result.rows[0];
+    return row
+      ? {
+          runId: String(row.id),
+          monitorId: String(row.monitor_id),
+          status: String(row.status),
+          startedAt: String(row.started_at),
+          completedAt: row.completed_at ? String(row.completed_at) : undefined,
+        }
+      : undefined;
   }
 
   async baseline(monitorId: string, sourceId: string) {
@@ -403,6 +435,18 @@ export class MonitorStore {
     return result.rows.map(row => JSON.parse(String(row.evidence_json)) as Evidence);
   }
 
+  async evidence(candidateId: string) {
+    const result = await this.client.execute({
+      sql: `SELECT p.evidence_json, s.source_url FROM pending_evidence p
+            JOIN snapshots s ON s.id = p.after_snapshot_id WHERE p.id = ?`,
+      args: [candidateId],
+    });
+    const row = result.rows[0];
+    return row
+      ? { evidence: JSON.parse(String(row.evidence_json)) as Evidence, sourceUrl: String(row.source_url) }
+      : undefined;
+  }
+
   async pendingIdsForSource(monitorId: string, sourceId: string) {
     const result = await this.client.execute({
       sql: 'SELECT id FROM pending_evidence WHERE monitor_id = ? AND source_id = ? AND status = ?',
@@ -429,7 +473,12 @@ export class MonitorStore {
   }
 
   /** Atomically reserves the full bounded native-call allowance. Reservations remain on uncertain billing. */
-  async reserveProviderBudget(input: { provider: 'jev'; candidateId: string; amountUsd: number; ceilingUsd: number }) {
+  async reserveProviderBudget(input: {
+    provider: 'jev' | 'openai';
+    candidateId: string;
+    amountUsd: number;
+    ceilingUsd: number;
+  }) {
     await this.init();
     const id = randomUUID();
     const amountUnits = Math.ceil(input.amountUsd * CLASSIFICATION_LIMITS.usdReservationUnits);
@@ -460,6 +509,34 @@ export class MonitorStore {
             WHERE id = ? AND status = 'uncertain' AND known_amount_units IS NULL AND unresolved_units = amount_units`,
       args: [id],
     });
+  }
+
+  /** Record completed provider usage only when all billed components are known within the original reservation. */
+  async settleProviderReservation(input: { id: string; knownAmountUnits: number; unresolvedUnits: number }) {
+    await this.init();
+    if (
+      !Number.isSafeInteger(input.knownAmountUnits) ||
+      !Number.isSafeInteger(input.unresolvedUnits) ||
+      input.knownAmountUnits < 0 ||
+      input.unresolvedUnits < 0
+    ) {
+      throw new Error('INVALID_PROVIDER_RESERVATION_SETTLEMENT');
+    }
+    const result = await this.client.execute({
+      sql: `UPDATE provider_reservations
+            SET known_amount_units = ?, unresolved_units = ?, status = CASE WHEN ? = 0 THEN 'settled' ELSE 'uncertain' END
+            WHERE id = ? AND status = 'uncertain' AND known_amount_units IS NULL AND unresolved_units = amount_units
+              AND ? + ? <= amount_units`,
+      args: [
+        input.knownAmountUnits,
+        input.unresolvedUnits,
+        input.unresolvedUnits,
+        input.id,
+        input.knownAmountUnits,
+        input.unresolvedUnits,
+      ],
+    });
+    return result.rowsAffected > 0;
   }
 
   async commitClassification(input: {
@@ -521,7 +598,7 @@ export class MonitorStore {
       : undefined;
   }
 
-  async reservedProviderUsd(provider: 'jev') {
+  async reservedProviderUsd(provider: 'jev' | 'openai') {
     const result = await this.client.execute({
       sql: 'SELECT COALESCE(SUM(COALESCE(known_amount_units + unresolved_units, amount_units)), 0) AS amount FROM provider_reservations WHERE provider = ?',
       args: [provider],
