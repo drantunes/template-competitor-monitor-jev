@@ -16,6 +16,7 @@ export const sourceSchema = z
     url: z.string().url().max(INPUT_LIMITS.maxUrlChars),
     kind: sourceKindSchema,
     fetchMode: fetchModeSchema.default('auto'),
+    minContentChars: z.number().int().min(1).max(SOURCE_LIMITS.minContentChars).optional(),
     contentSelector: z.string().trim().min(1).max(INPUT_LIMITS.maxSelectorChars).optional(),
     ignoreSelectors: z
       .array(z.string().trim().min(1).max(INPUT_LIMITS.maxSelectorChars))
@@ -115,6 +116,7 @@ export function validateMonitorInput(value: unknown): MonitorInput {
     if (previous) {
       const sameConfiguration =
         previous.fetchMode === source.fetchMode &&
+        previous.minContentChars === source.minContentChars &&
         previous.contentSelector === source.contentSelector &&
         JSON.stringify(previous.ignoreSelectors) === JSON.stringify(source.ignoreSelectors);
       if (!sameConfiguration) throw new Error(`DUPLICATE_SOURCE_CONFLICT:${source.id}`);
