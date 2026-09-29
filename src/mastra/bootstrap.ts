@@ -3,6 +3,7 @@ import { LibSQLStore } from '@mastra/libsql';
 
 import { loadConfig } from './config';
 import { createLocalObservability } from './lib/observability';
+import { createReportSummaryAgent } from './lib/reporting';
 import { ensureDatabaseDirectory, MonitorStore } from './lib/store';
 import { createCompetitorMonitorWorkflow } from './workflows/competitor-monitor-workflow';
 
@@ -11,13 +12,18 @@ export function initializeRuntime(environment: Readonly<Record<string, string | 
   const config = loadConfig(environment);
   ensureDatabaseDirectory(config.storage.mastraUrl);
   const applicationStore = MonitorStore.open(config.storage.monitorUrl);
-  const workflow = createCompetitorMonitorWorkflow({ store: applicationStore, config });
+  const summaryAgent =
+    config.credentials.openaiApiKey && config.billing.openaiCostAttested
+      ? createReportSummaryAgent(config.credentials.openaiApiKey)
+      : undefined;
+  const workflow = createCompetitorMonitorWorkflow({ store: applicationStore, config, summaryAgent });
   const frameworkStore = new LibSQLStore({ id: 'competitor-monitor-framework', url: config.storage.mastraUrl });
   return {
     config,
     applicationStore,
     frameworkStore,
     workflow,
+    summaryAgent,
     observability: createLocalObservability(),
     server:
       config.executionMode === 'production'

@@ -1,3 +1,5 @@
+const SUMMARY_FIXED_INPUT_TOKEN_RESERVE = 4_000;
+
 export const MODEL_DEFAULTS = {
   // Alias, not a reproducible pin. JEV_MODEL may select a verified nonempty model ID.
   jev: 'jev-latest',
@@ -7,8 +9,24 @@ export const MODEL_DEFAULTS = {
   summaryReasoning: 'none',
   // Tokens/request including prompt, evidence and schema; hard ceiling, no env override.
   summaryMaxInputTokens: 8_000,
+  // Conservative token allowance for native instructions and the structured-output schema; hard ceiling, no env override.
+  summaryFixedInputTokenReserve: SUMMARY_FIXED_INPUT_TOKEN_RESERVE,
+  // UTF-8 bytes for JSON evidence. A byte bound conservatively upper-bounds prompt tokens and leaves the fixed reserve.
+  summaryPromptMaxUtf8Bytes: 8_000 - SUMMARY_FIXED_INPUT_TOKEN_RESERVE,
   // Tokens/response; hard ceiling for concise structured output, no env override.
   summaryMaxOutputTokens: 800,
+  // UTF-16 code units for supplied evidence. The UTF-8 byte bound is the input-token safety control.
+  summaryEvidenceMaxCharacters: 4_000,
+} as const;
+
+// Structured summary response ceilings. They bound model prose and references independently of request tokens.
+export const SUMMARY_LIMITS = {
+  // Characters in the generated explanation; keeps reports concise and reviewable.
+  explanationMaxCharacters: 2_000,
+  // Evidence change IDs the model may cite in one summary.
+  maxCitedChangeIds: 20,
+  // Exact supplied excerpts the model may quote in one summary.
+  maxQuotedEvidence: 20,
 } as const;
 
 // Dataset planning seeds, not quality targets. No environment overrides.

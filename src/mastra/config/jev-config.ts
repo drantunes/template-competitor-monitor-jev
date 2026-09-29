@@ -28,3 +28,10 @@ export const CLASSIFICATION_LIMITS = {
   // Integer microdollars/USD; avoids floating-point budget comparison drift in durable reservations.
   usdReservationUnits: 1_000_000,
 } as const;
+
+// Maximum standard-rate cost of one bounded Luna summary; reserve before dispatch.
+export const SUMMARY_RESERVATION_USD =
+  (MODEL_DEFAULTS.summaryMaxInputTokens * PRICING_REFERENCE.openaiInputUsdPerMillion +
+    MODEL_DEFAULTS.summaryMaxOutputTokens * PRICING_REFERENCE.openaiOutputUsdPerMillion) /
+  PRICING_REFERENCE.tokensPerPricingUnit;
+import { MODEL_DEFAULTS } from './model-defaults-config';

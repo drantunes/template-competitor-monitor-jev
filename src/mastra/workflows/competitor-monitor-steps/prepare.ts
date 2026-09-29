@@ -12,10 +12,10 @@ export function createPrepareStep(context: StepContext) {
       'Validates a monitor invocation, obtains its same-monitor lock, and prepares bounded source work items.',
     inputSchema: monitorInputSchema,
     outputSchema: z.array(sourceTaskSchema),
-    execute: async ({ inputData, abortSignal }) => {
+    execute: async ({ inputData, abortSignal, runId }) => {
       const input = validateMonitorInput(inputData);
       validateEffectiveLimits(input, dependencies.config);
-      const run = await dependencies.store.beginRun(input.monitorId);
+      const run = await dependencies.store.beginRun(input.monitorId, runId);
       const cleanUpCancellation = () => finishCanceledRun(run.id, run.monitorId);
       if (abortSignal.aborted) {
         await cleanUpCancellation();

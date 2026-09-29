@@ -2,6 +2,7 @@ import { z } from 'zod';
 
 import type { MonitorConfig } from '../../config';
 import type { DnsResolver, PinnedTransport } from '../../lib/acquisition';
+import { reportSchema, type SummaryAgent } from '../../lib/reporting';
 import { MonitorStore } from '../../lib/store';
 import { monitorInputSchema, sourceSchema, type MonitorInput } from '../../schemas';
 
@@ -20,6 +21,7 @@ export type MonitorRunResult = {
   sources: Array<{
     sourceId: string;
     status: 'baseline_created' | 'unchanged' | 'changed' | 'failed';
+    acquisitionCompleted?: boolean;
     error?: { code: string; retryable: boolean };
     outcome?: string;
     warnings?: string[];
@@ -30,7 +32,13 @@ export type MonitorRunResult = {
     status: 'classified' | 'deferred' | 'failed' | 'pending';
     reason?: string;
     route?: 'alert' | 'review' | 'record' | 'ignore';
+    evidence?: {
+      sourceUrl: string;
+      beforeExcerpt: string;
+      afterExcerpt: string;
+    };
   }>;
+  report: z.infer<typeof reportSchema>;
 };
 
 export type Dependencies = {
@@ -38,6 +46,7 @@ export type Dependencies = {
   config: MonitorConfig;
   resolver?: DnsResolver;
   transport?: PinnedTransport;
+  summaryAgent?: SummaryAgent;
 };
 
 export class RunConcurrencyLimiter {
@@ -79,6 +88,7 @@ export const workflowOutputSchema = z.object({
     z.object({
       sourceId: z.string(),
       status: z.enum(['baseline_created', 'unchanged', 'changed', 'failed']),
+      acquisitionCompleted: z.boolean().optional(),
       error: z.object({ code: z.string(), retryable: z.boolean() }).optional(),
       outcome: z.string().optional(),
       warnings: z.array(z.string()).optional(),
@@ -91,8 +101,12 @@ export const workflowOutputSchema = z.object({
       status: z.enum(['classified', 'deferred', 'failed', 'pending']),
       reason: z.string().optional(),
       route: z.enum(['alert', 'review', 'record', 'ignore']).optional(),
+      evidence: z
+        .object({ sourceUrl: z.string().url(), beforeExcerpt: z.string(), afterExcerpt: z.string() })
+        .optional(),
     }),
   ),
+  report: reportSchema,
 });
 
 export const sourceTaskSchema = z.object({ runId: z.string(), input: monitorInputSchema, source: sourceSchema });

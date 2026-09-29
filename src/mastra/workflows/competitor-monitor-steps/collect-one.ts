@@ -1,6 +1,6 @@
 import { createStep } from '@mastra/core/workflows';
 
-import { processSource } from '../source-processing';
+import { CompletedAcquisitionError, processSource } from '../source-processing';
 import { errorDetails, sourceTaskSchema, sourceProcessedSchema, type StepContext } from './workflow-context';
 
 export function createCollectOneStep(context: StepContext) {
@@ -36,7 +36,12 @@ export function createCollectOneStep(context: StepContext) {
           runId: inputData.runId,
           monitorId: inputData.input.monitorId,
           sourceId: inputData.source.id,
-          source: { sourceId: inputData.source.id, status: 'failed' as const, error: detail },
+          source: {
+            sourceId: inputData.source.id,
+            status: 'failed' as const,
+            acquisitionCompleted: error instanceof CompletedAcquisitionError,
+            error: detail,
+          },
         };
       }
     },
