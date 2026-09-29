@@ -2,7 +2,7 @@ import { z } from 'zod';
 
 import type { MonitorConfig } from '../../config';
 import type { DnsResolver, PinnedTransport } from '../../lib/acquisition';
-import { reportSchema, type SummaryAgent } from '../../lib/reporting';
+import { reportChangeSchema, reportSchema, type SummaryAgent } from '../../lib/reporting';
 import { MonitorStore } from '../../lib/store';
 import { monitorInputSchema, sourceSchema, type MonitorInput } from '../../schemas';
 
@@ -26,18 +26,7 @@ export type MonitorRunResult = {
     outcome?: string;
     warnings?: string[];
   }>;
-  changes: Array<{
-    id: string;
-    sourceId: string;
-    status: 'classified' | 'deferred' | 'failed' | 'pending';
-    reason?: string;
-    route?: 'alert' | 'review' | 'record' | 'ignore';
-    evidence?: {
-      sourceUrl: string;
-      beforeExcerpt: string;
-      afterExcerpt: string;
-    };
-  }>;
+  changes: z.infer<typeof reportChangeSchema>[];
   report: z.infer<typeof reportSchema>;
 };
 
@@ -94,18 +83,7 @@ export const workflowOutputSchema = z.object({
       warnings: z.array(z.string()).optional(),
     }),
   ),
-  changes: z.array(
-    z.object({
-      id: z.string(),
-      sourceId: z.string(),
-      status: z.enum(['classified', 'deferred', 'failed', 'pending']),
-      reason: z.string().optional(),
-      route: z.enum(['alert', 'review', 'record', 'ignore']).optional(),
-      evidence: z
-        .object({ sourceUrl: z.string().url(), beforeExcerpt: z.string(), afterExcerpt: z.string() })
-        .optional(),
-    }),
-  ),
+  changes: z.array(reportChangeSchema),
   report: reportSchema,
 });
 

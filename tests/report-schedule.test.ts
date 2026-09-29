@@ -8,7 +8,7 @@ import { Classifier } from '@mastra/core/classifier';
 import { LibSQLStore } from '@mastra/libsql';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { loadConfig, MODEL_DEFAULTS } from '../src/mastra/config';
+import { loadConfig, MODEL_DEFAULTS, POLICY_DEFAULTS } from '../src/mastra/config';
 import { SUMMARY_RESERVATION_USD } from '../src/mastra/config/jev-config';
 import {
   buildReport,
@@ -19,7 +19,7 @@ import {
 import { ensureWeeklyMonitorSchedule, monitorScheduleHistory } from '../src/mastra/lib/schedules';
 import { MonitorStore } from '../src/mastra/lib/store';
 import { createCompetitorMonitorWorkflow } from '../src/mastra/workflows/competitor-monitor-workflow';
-import { COMPETITOR_CHANGE_QUESTIONS } from '../src/mastra/lib/classification';
+import { COMPETITOR_CHANGE_QUESTIONS, QUESTION_SET_VERSION, RULE_VERSION } from '../src/mastra/lib/classification';
 
 let stores: MonitorStore[] = [];
 let frameworks: LibSQLStore[] = [];
@@ -54,7 +54,7 @@ const classifiedAnswers = {
   is_cosmetic_or_promotional: { type: 'boolean' as const, probability: 0.1 },
 };
 
-function fixtureClassifier() {
+function fixtureClassifier(onEvaluate?: () => void) {
   return new Classifier({
     id: 'competitor-change-classifier',
     questions: COMPETITOR_CHANGE_QUESTIONS,
@@ -63,14 +63,17 @@ function fixtureClassifier() {
       provider: 'fixture',
       modelId: 'fixture',
       supportedQuestionTypes: ['choice', 'score', 'boolean'],
-      doEvaluate: async () => ({
-        answers: classifiedAnswers,
-        usage: {},
-        warnings: [],
-        rounding: {},
-        providerMetadata: { typesafe: { confidence: { change_type: 1, relevance: 1, business_impact: 1 } } },
-        response: { modelId: 'fixture', timestamp: new Date() },
-      }),
+      doEvaluate: async () => {
+        onEvaluate?.();
+        return {
+          answers: classifiedAnswers,
+          usage: {},
+          warnings: [],
+          rounding: {},
+          providerMetadata: { typesafe: { confidence: { change_type: 1, relevance: 1, business_impact: 1 } } },
+          response: { modelId: 'fixture', timestamp: new Date() },
+        };
+      },
     } as any,
   });
 }
@@ -213,14 +216,22 @@ describe('grounded reports and native schedules', () => {
       new Set(),
       'Starter costs $19. ',
     );
+    let evaluations = 0;
     const publicResult = await executeMonitor(
       input({ generateSummary: false }),
       workflowConfig,
       workflowStore,
       new Set(),
       'Starter costs $29. ',
-      fixtureClassifier(),
+      fixtureClassifier(() => {
+        evaluations += 1;
+      }),
     );
+    const nativeProvenance = {
+      questionSetVersion: QUESTION_SET_VERSION,
+      ruleVersion: RULE_VERSION,
+      model: { requested: workflowConfig.models.jev, reported: 'fixture', verified: null },
+    };
     expect(publicResult).toMatchObject({
       status: 'success',
       report: { summaryFailure: 'SUMMARY_DISABLED' },
@@ -232,12 +243,44 @@ describe('grounded reports and native schedules', () => {
             beforeExcerpt: expect.stringContaining('$19'),
             afterExcerpt: expect.stringContaining('$29'),
           },
+          provenance: nativeProvenance,
         },
       ],
+    });
+    expect(evaluations).toBe(1);
+    const durableRun = await workflowStore.client.execute({
+      sql: 'SELECT result_json FROM monitor_runs WHERE id = ?',
+      args: [publicResult.runId],
+    });
+    expect(JSON.parse(String(durableRun.rows[0]!.result_json))).toMatchObject({
+      changes: [{ provenance: nativeProvenance }],
+    });
+    expect(await workflowStore.classification(publicResult.changes[0]!.id)).toMatchObject({
+      questionSetVersion: QUESTION_SET_VERSION,
+      ruleVersion: RULE_VERSION,
     });
     const { config, store, runId } = await seededReport();
     const pending = await store.pendingForRun(runId);
     const change = { id: pending[0]!.id, sourceId: 'pricing', status: 'classified' as const, route: 'alert' as const };
+    const storedProvenance = {
+      questionSetVersion: 'stored-question-set-v9',
+      ruleVersion: 'stored-routing-v9',
+      model: { requested: 'stored-requested', reported: 'stored-reported', verified: null },
+    };
+    await store.commitClassification({
+      candidateId: change.id,
+      questionSetVersion: storedProvenance.questionSetVersion,
+      decision: {
+        route: 'alert',
+        reason: 'STORED_HISTORY',
+        ruleVersion: storedProvenance.ruleVersion,
+        effectivePolicy: POLICY_DEFAULTS,
+      },
+      audit: {
+        requestedModel: storedProvenance.model.requested,
+        reportedModel: storedProvenance.model.reported,
+      },
+    });
     const disabled = await buildReport({
       runId,
       changes: [change],
@@ -247,8 +290,28 @@ describe('grounded reports and native schedules', () => {
     });
     expect(disabled).toMatchObject({
       summaryFailure: 'SUMMARY_DISABLED',
-      changes: [{ evidence: { sourceUrl: expect.any(String) } }],
+      changes: [{ evidence: { sourceUrl: expect.any(String) }, provenance: storedProvenance }],
     });
+    expect(await store.classification(change.id)).toMatchObject({
+      questionSetVersion: storedProvenance.questionSetVersion,
+      ruleVersion: storedProvenance.ruleVersion,
+    });
+    const withoutClassification = await buildReport({
+      runId,
+      changes: [
+        {
+          id: 'without-persisted-classification',
+          sourceId: 'pricing',
+          status: 'deferred',
+          reason: 'PENDING',
+          provenance: storedProvenance,
+        },
+      ],
+      generateSummary: false,
+      config,
+      store,
+    });
+    expect(withoutClassification.changes[0]).not.toHaveProperty('provenance');
     const failingAgent: SummaryAgent = {
       generate: async () => Promise.reject(new Error('provider down')),
     } as SummaryAgent;

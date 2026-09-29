@@ -51,6 +51,13 @@ export type PendingCandidate = Evidence & {
   afterSnapshotId: string;
 };
 
+export type StoredClassification = {
+  questionSetVersion: string;
+  ruleVersion: string;
+  decision: ClassificationDecision;
+  audit: Record<string, unknown>;
+};
+
 // Startup recovery belongs to the local database, not to each client handle in this process.
 const localDatabaseOwners = new Map<string, { owners: Set<MonitorStore>; recovery?: Promise<void> }>();
 
@@ -586,15 +593,18 @@ export class MonitorStore {
 
   async classification(candidateId: string) {
     const result = await this.client.execute({
-      sql: 'SELECT decision_json, audit_json FROM classification_decisions WHERE candidate_id = ?',
+      sql: `SELECT question_set_version, rule_version, decision_json, audit_json
+            FROM classification_decisions WHERE candidate_id = ? ORDER BY created_at DESC LIMIT 1`,
       args: [candidateId],
     });
     const row = result.rows[0];
     return row
-      ? {
+      ? ({
+          questionSetVersion: String(row.question_set_version),
+          ruleVersion: String(row.rule_version),
           decision: JSON.parse(String(row.decision_json)) as ClassificationDecision,
-          audit: JSON.parse(String(row.audit_json)),
-        }
+          audit: JSON.parse(String(row.audit_json)) as Record<string, unknown>,
+        } satisfies StoredClassification)
       : undefined;
   }
 
