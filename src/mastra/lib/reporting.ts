@@ -24,18 +24,27 @@ const summarySchema = z.object({
 
 export type ReportSummary = z.infer<typeof summarySchema>;
 
-export type ReportChange = {
-  id: string;
-  sourceId: string;
-  status: 'classified' | 'deferred' | 'failed' | 'pending';
-  route?: 'alert' | 'review' | 'record' | 'ignore';
-  reason?: string;
-  evidence?: {
-    sourceUrl: string;
-    beforeExcerpt: string;
-    afterExcerpt: string;
-  };
-};
+export const classificationProvenanceSchema = z.object({
+  questionSetVersion: z.string(),
+  ruleVersion: z.string(),
+  model: z.object({
+    requested: z.string().nullable(),
+    reported: z.string().nullable(),
+    verified: z.string().nullable(),
+  }),
+});
+
+export const reportChangeSchema = z.object({
+  id: z.string(),
+  sourceId: z.string(),
+  status: z.enum(['classified', 'deferred', 'failed', 'pending']),
+  route: z.enum(['alert', 'review', 'record', 'ignore']).optional(),
+  reason: z.string().optional(),
+  evidence: z.object({ sourceUrl: z.string().url(), beforeExcerpt: z.string(), afterExcerpt: z.string() }).optional(),
+  provenance: classificationProvenanceSchema.optional(),
+});
+
+export type ReportChange = z.infer<typeof reportChangeSchema>;
 
 export type Report = {
   summary?: ReportSummary;
@@ -160,9 +169,13 @@ function summaryUsageUnits(usage: unknown) {
 async function reportChanges(store: MonitorStore, changes: ReportChange[]) {
   return Promise.all(
     changes.map(async change => {
-      const evidence = await store.evidence(change.id);
+      const { provenance: _ignoredProvenance, ...reportedChange } = change;
+      const [evidence, classification] = await Promise.all([
+        store.evidence(change.id),
+        store.classification(change.id),
+      ]);
       return {
-        ...change,
+        ...reportedChange,
         ...(evidence
           ? {
               evidence: {
@@ -172,9 +185,27 @@ async function reportChanges(store: MonitorStore, changes: ReportChange[]) {
               },
             }
           : {}),
+        ...(classification
+          ? {
+              provenance: {
+                questionSetVersion: classification.questionSetVersion,
+                ruleVersion: classification.ruleVersion,
+                model: {
+                  requested: modelIdentity(classification.audit, 'requestedModel'),
+                  reported: modelIdentity(classification.audit, 'reportedModel'),
+                  verified: modelIdentity(classification.audit, 'verifiedModel'),
+                },
+              },
+            }
+          : {}),
       };
     }),
   );
+}
+
+function modelIdentity(audit: Record<string, unknown>, field: 'requestedModel' | 'reportedModel' | 'verifiedModel') {
+  const value = audit[field];
+  return typeof value === 'string' && value.trim().length > 0 ? value : null;
 }
 
 /** Assemble code-owned URLs/excerpts first; a summary can only add validated prose for alert or review. */
