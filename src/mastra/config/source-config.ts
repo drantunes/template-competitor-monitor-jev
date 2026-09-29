@@ -14,6 +14,8 @@ export const SOURCE_LIMITS = {
   maxCandidatesPerSource: 50,
   // Decoded bytes/source; hard ceiling. Reject oversized responses rather than truncate.
   maxHtmlBytes: 2 * 1024 * 1024,
+  // Same-origin GET resources rendered by a browser source; hard ceiling across document and scripts.
+  maxBrowserResources: 20,
   // Normalized characters/source; hard ceiling. Excess content is explicitly incomplete.
   maxNormalizedChars: 100_000,
   // Characters/before or after excerpt; hard ceiling, preserving semantic blocks.
@@ -36,6 +38,12 @@ export const TIMING = {
   httpAttemptMs: 15_000,
   // Browser attempt deadline, including rendering and extraction.
   browserAttemptMs: 30_000,
+  // Chrome DevTools readiness poll; fixed to fail unavailable binaries before the browser attempt deadline.
+  browserLauncherPollMs: 250,
+  // Chrome DevTools readiness retries; fixed with no env override to bound launch failure.
+  browserLauncherMaxRetries: 20,
+  // Browser/CDP cleanup deadline; process and proxy cleanup continue if the remote manager stalls.
+  browserCleanupMs: 1_000,
   // Whole Jev evaluation deadline, including all SDK retries.
   jevCallMs: 30_000,
   // Whole summary generation deadline, including retries.

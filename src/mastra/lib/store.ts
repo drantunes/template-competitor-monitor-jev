@@ -27,11 +27,12 @@ export type Snapshot = {
 };
 
 export type SnapshotAcquisition = {
-  mode: 'http';
+  mode: 'http' | 'browser';
   finalUrl: string;
   status: number;
   durationMs: number;
   retries: number;
+  fallbackReason?: 'explicit_browser' | 'short_content' | 'selector_missing' | 'client_render_placeholder';
 };
 
 export type StoredRun = {

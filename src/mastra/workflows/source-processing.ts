@@ -1,6 +1,8 @@
-import { SOURCE_LIMITS } from '../config';
+import { SOURCE_LIMITS, TIMING } from '../config';
 import { assertRobotsAllowed, fetchPublicPage } from '../lib/acquisition';
+import { renderPublicPage } from '../lib/browser';
 import { diffContent, normalizeHtml, NORMALIZATION_VERSION, type NormalizedContent } from '../lib/content';
+import type { SnapshotAcquisition } from '../lib/store';
 import { normalizedSourceUrl, type MonitorInput, type MonitorSource } from '../schemas';
 import type { Dependencies, MonitorRunResult } from './competitor-monitor-steps/workflow-context';
 
@@ -18,6 +20,23 @@ function rejectedPageContent(content: NormalizedContent, html: string) {
   return (login && hasPasswordForm) || ((challenge || serviceFailure) && corroboratingFailure);
 }
 
+function clientRenderPlaceholder(content: NormalizedContent, minimumContentChars: number) {
+  return (
+    content.text.length < minimumContentChars &&
+    /^(?:[\w -]{1,80}\s+)?(?:loading(?:\.{1,3}|…)?|please wait(?:\.{1,3}|…)?|enable javascript(?:\.{1,3}|…)?)$/i.test(
+      content.text.trim(),
+    )
+  );
+}
+
+function shortRenderShell(content: NormalizedContent, html: string, minimumContentChars: number) {
+  return (
+    content.text.length < minimumContentChars &&
+    (content.language === 'english' ||
+      (content.language === 'undetermined' && /[a-z]/i.test(content.text) && /<script\b/i.test(html)))
+  );
+}
+
 export async function processSource(
   input: MonitorInput,
   runId: string,
@@ -25,8 +44,19 @@ export async function processSource(
   dependencies: Dependencies,
   abortSignal?: AbortSignal,
 ): Promise<{ source: MonitorRunResult['sources'][number] }> {
+  const deadline = AbortSignal.timeout(TIMING.acquisitionDeadlineMs);
+  const acquisitionSignal = abortSignal ? AbortSignal.any([abortSignal, deadline]) : deadline;
   const throwIfCanceled = () => {
     if (abortSignal?.aborted) throw new Error('ACQUISITION_CANCELED');
+    if (deadline.aborted) throw new Error('ACQUISITION_TIMEOUT');
+  };
+  const withinDeadline = async <T>(operation: Promise<T>) => {
+    try {
+      return await operation;
+    } catch (error) {
+      if (!abortSignal?.aborted && deadline.aborted) throw new Error('ACQUISITION_TIMEOUT');
+      throw error;
+    }
   };
   throwIfCanceled();
   const normalizedUrl = normalizedSourceUrl(source.url);
@@ -36,29 +66,57 @@ export async function processSource(
     version: NORMALIZATION_VERSION,
     contentSelector: source.contentSelector,
     ignoreSelectors: source.ignoreSelectors,
+    minContentChars: source.minContentChars,
   });
   if (storedIdentity && (storedIdentity.url !== normalizedUrl || storedIdentity.profile !== profile)) {
     throw new Error('SOURCE_ID_REBOUND');
   }
-  if (source.fetchMode === 'browser') throw new Error('BROWSER_UNAVAILABLE_F1');
-  await assertRobotsAllowed(normalizedUrl, { ...dependencies, abortSignal });
+  await withinDeadline(assertRobotsAllowed(normalizedUrl, { ...dependencies, abortSignal: acquisitionSignal }));
   throwIfCanceled();
-  const acquired = await fetchPublicPage(normalizedUrl, { ...dependencies, abortSignal });
+  let acquired = await withinDeadline(
+    fetchPublicPage(normalizedUrl, { ...dependencies, abortSignal: acquisitionSignal }),
+  );
+  let content: NormalizedContent | undefined;
+  const minimumContentChars = source.minContentChars ?? SOURCE_LIMITS.minContentChars;
+  let fallbackReason:
+    'explicit_browser' | 'short_content' | 'selector_missing' | 'client_render_placeholder' | undefined;
+  if (source.fetchMode === 'browser') {
+    fallbackReason = 'explicit_browser';
+  } else {
+    try {
+      content = normalizeHtml(acquired.html, source);
+    } catch (error) {
+      if (source.fetchMode === 'auto' && error instanceof Error && error.message === 'CONTENT_SELECTOR_MISSING') {
+        fallbackReason = 'selector_missing';
+      } else {
+        throw error;
+      }
+    }
+    if (source.fetchMode === 'auto' && !fallbackReason && content && !rejectedPageContent(content, acquired.html)) {
+      if (clientRenderPlaceholder(content, minimumContentChars)) {
+        fallbackReason = 'client_render_placeholder';
+      } else if (shortRenderShell(content, acquired.html, minimumContentChars)) {
+        fallbackReason = 'short_content';
+      }
+    }
+  }
+  if (fallbackReason) {
+    acquired = await withinDeadline(renderPublicPage(acquired, { ...dependencies, abortSignal: acquisitionSignal }));
+    content = normalizeHtml(acquired.html, source);
+  }
+  if (!content) throw new Error('CONTENT_MISSING');
   throwIfCanceled();
-  const acquisition = {
-    mode: 'http' as const,
+  const acquisition: SnapshotAcquisition = {
+    mode: fallbackReason ? 'browser' : 'http',
     finalUrl: acquired.url,
     status: acquired.status,
     durationMs: acquired.durationMs,
     retries: acquired.retries,
+    ...(fallbackReason ? { fallbackReason } : {}),
   };
-  const content = normalizeHtml(acquired.html, source);
   if (rejectedPageContent(content, acquired.html)) throw new Error('BLOCKED_OR_AUTHENTICATED_CONTENT');
   if (content.language === 'unsupported') throw new Error('UNSUPPORTED_LANGUAGE');
   if (content.language === 'undetermined') throw new Error('LANGUAGE_UNDETERMINED');
-  if (content.truncated) throw new Error('NORMALIZED_CONTENT_LIMIT');
-  if (content.text.length < SOURCE_LIMITS.minContentChars) throw new Error('CONTENT_QUALITY_TOO_LOW');
-  if (content.lossRatio > SOURCE_LIMITS.maxContentLossRatio) throw new Error('CONTENT_QUALITY_LOSS');
   const baseline = await dependencies.store.baseline(input.monitorId, source.id);
   throwIfCanceled();
   if (
@@ -87,6 +145,9 @@ export async function processSource(
       },
     };
   }
+  if (content.truncated) throw new Error('NORMALIZED_CONTENT_LIMIT');
+  if (content.text.length < minimumContentChars) throw new Error('CONTENT_QUALITY_TOO_LOW');
+  if (content.lossRatio > SOURCE_LIMITS.maxContentLossRatio) throw new Error('CONTENT_QUALITY_LOSS');
   if (!baseline) {
     await dependencies.store.persistAcceptedSnapshot({
       runId,

@@ -15,7 +15,8 @@
     "typecheck": "tsc --noEmit",
     "test:unit": "vitest run tests/config.test.ts",
     "test:classification": "vitest run tests/classification-policy.test.ts tests/workflow-persistence.test.ts",
-    "test:integration": "vitest run tests/acquisition-content.test.ts tests/workflow-persistence.test.ts tests/native-auth.test.ts"
+    "test:integration": "vitest run tests/acquisition-content.test.ts tests/workflow-persistence.test.ts tests/native-auth.test.ts",
+    "test:browser": "vitest run --no-file-parallelism tests/browser-boundary.test.ts tests/browser-fallback.test.ts"
   },
   "dependencies": {
     "@ai-sdk/typesafe-ai": "3.0.9",
@@ -23,7 +24,9 @@
     "@mastra/core": "latest",
     "@mastra/libsql": "latest",
     "@mastra/observability": "latest",
+    "@mastra/stagehand": "latest",
     "cheerio": "^1.2.0",
+    "chrome-launcher": "^1.2.1",
     "franc-min": "6.2.0",
     "ipaddr.js": "^2.5.0",
     "robots-parser": "^3.0.1",
