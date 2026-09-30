@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-import { PROJECT_BUDGET_USD } from './jev-config';
+import { JEV_ACCESS, PROJECT_BUDGET_USD } from './jev-config';
 import { MODEL_DEFAULTS } from './model-defaults-config';
 import {
   OVERRIDE_BOUNDS,
@@ -62,7 +62,9 @@ const environmentSchema = z
       PROJECT_BUDGET_USD.openai,
     ),
     JEV_MODEL: z.string().trim().min(1).default(MODEL_DEFAULTS.jev),
+    JEV_ACCESS_MODE: z.enum([JEV_ACCESS.direct, JEV_ACCESS.vercelGateway]).default(JEV_ACCESS.direct),
     TYPESAFE_AI_API_KEY: z.string().trim().min(1).optional(),
+    AI_GATEWAY_API_KEY: z.string().trim().min(1).optional(),
     // Operator confirms this exact configured model/account uses the published bounded Jev tariff before a paid call.
     JEV_COST_ATTESTATION: z.string().trim().min(1).optional(),
     OPENAI_API_KEY: z.string().trim().min(1).optional(),
@@ -79,6 +81,12 @@ const environmentSchema = z
     } else if (token?.trim() && /\s/.test(token)) {
       context.addIssue({ code: 'custom', path: ['MASTRA_API_TOKEN'], message: 'Token must not contain whitespace' });
     }
+    if (
+      env.JEV_ACCESS_MODE === JEV_ACCESS.vercelGateway &&
+      !([MODEL_DEFAULTS.jev, JEV_ACCESS.vercelGatewayModel] as string[]).includes(env.JEV_MODEL)
+    ) {
+      context.addIssue({ code: 'custom', path: ['JEV_MODEL'], message: 'Gateway model is fixed' });
+    }
   });
 
 /** Call once at startup. Importing constants neither reads credentials nor starts services. */
@@ -91,6 +99,8 @@ export function loadConfig(environment: Readonly<Record<string, string | undefin
   }
 
   const env = result.data;
+  const gateway = env.JEV_ACCESS_MODE === JEV_ACCESS.vercelGateway;
+  const jevModel = gateway ? JEV_ACCESS.vercelGatewayModel : env.JEV_MODEL;
   const projectRoot = resolveStorageRoot(environment, env.MASTRA_PROJECT_ROOT);
   return {
     executionMode: env.EXECUTION_MODE,
@@ -104,10 +114,21 @@ export function loadConfig(environment: Readonly<Record<string, string | undefin
       concurrency: env.SOURCE_CONCURRENCY,
       candidatesPerSource: env.CANDIDATES_PER_SOURCE,
     },
-    models: { ...MODEL_DEFAULTS, jev: env.JEV_MODEL },
-    credentials: { jevApiKey: env.TYPESAFE_AI_API_KEY, openaiApiKey: env.OPENAI_API_KEY },
+    models: { ...MODEL_DEFAULTS, jev: jevModel },
+    jev: {
+      accessMode: env.JEV_ACCESS_MODE,
+      baseURL: gateway ? JEV_ACCESS.vercelGatewayBaseUrl : undefined,
+    },
+    credentials: {
+      jevApiKey: gateway ? env.AI_GATEWAY_API_KEY : env.TYPESAFE_AI_API_KEY,
+      openaiApiKey: env.OPENAI_API_KEY,
+    },
     billing: {
-      jevCostAttested: env.JEV_COST_ATTESTATION === `typesafe-jev-2026-09-27:${env.JEV_MODEL}`,
+      jevCostAttested:
+        env.JEV_COST_ATTESTATION ===
+        (gateway
+          ? `vercel-ai-gateway-typesafe-2026-09-29:${JEV_ACCESS.vercelGatewayModel}`
+          : `typesafe-jev-2026-09-27:${jevModel}`),
       openaiCostAttested: env.OPENAI_COST_ATTESTATION === `openai-gpt-6-luna-2026-09-29:${MODEL_DEFAULTS.summary}`,
     },
     budgetUsd: { jev: env.JEV_BUDGET_USD, openai: env.OPENAI_BUDGET_USD },

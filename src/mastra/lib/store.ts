@@ -251,7 +251,7 @@ export class MonitorStore {
   async runForNativeWorkflowRunId(nativeWorkflowRunId: string) {
     await this.init();
     const result = await this.client.execute({
-      sql: `SELECT id, monitor_id, status, started_at, completed_at
+      sql: `SELECT id, monitor_id, status, started_at, completed_at, result_json
             FROM monitor_runs WHERE native_workflow_run_id = ?`,
       args: [nativeWorkflowRunId],
     });
@@ -263,6 +263,7 @@ export class MonitorStore {
           status: String(row.status),
           startedAt: String(row.started_at),
           completedAt: row.completed_at ? String(row.completed_at) : undefined,
+          result: row.result_json ? JSON.parse(String(row.result_json)) : undefined,
         }
       : undefined;
   }
@@ -277,6 +278,28 @@ export class MonitorStore {
     const row = result.rows[0];
     if (!row) return undefined;
     return this.rowToSnapshot(row);
+  }
+
+  /** Immutable accepted or quarantined capture recorded by one completed monitor run. */
+  async snapshotForRunSource(runId: string, sourceId: string) {
+    await this.init();
+    const outcome = await this.client.execute({
+      sql: 'SELECT status, detail_json FROM source_outcomes WHERE run_id = ? AND source_id = ?',
+      args: [runId, sourceId],
+    });
+    const row = outcome.rows[0];
+    if (!row) return undefined;
+    const detail = JSON.parse(String(row.detail_json)) as { snapshotId?: unknown };
+    if (typeof detail.snapshotId !== 'string') return { status: String(row.status), detail };
+    const snapshot = await this.client.execute({
+      sql: 'SELECT * FROM snapshots WHERE id = ?',
+      args: [detail.snapshotId],
+    });
+    return {
+      status: String(row.status),
+      detail,
+      snapshot: snapshot.rows[0] ? this.rowToSnapshot(snapshot.rows[0]) : undefined,
+    };
   }
 
   async sourceIdentity(monitorId: string, sourceId: string) {
@@ -614,6 +637,18 @@ export class MonitorStore {
       args: [provider],
     });
     return Number(result.rows[0]?.amount ?? 0) / CLASSIFICATION_LIMITS.usdReservationUnits;
+  }
+
+  /** Durable provider totals distinguish reconciled spend from attempts whose billing remains unknown. */
+  async providerBudgetAccounting(provider: 'jev' | 'openai') {
+    const result = await this.client.execute({
+      sql: `SELECT COALESCE(SUM(known_amount_units), 0) AS known, COALESCE(SUM(unresolved_units), 0) AS unresolved
+            FROM provider_reservations WHERE provider = ?`,
+      args: [provider],
+    });
+    const knownUsd = Number(result.rows[0]?.known ?? 0) / CLASSIFICATION_LIMITS.usdReservationUnits;
+    const unresolvedUsd = Number(result.rows[0]?.unresolved ?? 0) / CLASSIFICATION_LIMITS.usdReservationUnits;
+    return { knownUsd, unresolvedUsd, reservedUsd: knownUsd + unresolvedUsd };
   }
 
   async pendingWarningsForSource(monitorId: string, sourceId: string): Promise<string[]> {

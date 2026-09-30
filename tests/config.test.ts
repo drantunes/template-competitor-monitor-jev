@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { INPUT_LIMITS, loadConfig } from '../src/mastra/config';
+import { INPUT_LIMITS, JEV_ACCESS, loadConfig } from '../src/mastra/config';
 import { validateMonitorInput } from '../src/mastra/schemas';
 
 afterEach(() => vi.unstubAllEnvs());
@@ -44,6 +44,29 @@ describe('execution configuration', () => {
     });
   });
 
+  it('pins the optional Vercel Gateway Jev route without accepting an arbitrary destination or model', () => {
+    const config = loadConfig({
+      JEV_ACCESS_MODE: 'vercel-gateway',
+      AI_GATEWAY_API_KEY: 'gateway-test-key',
+      JEV_COST_ATTESTATION: 'vercel-ai-gateway-typesafe-2026-09-29:typesafe-ai/jev',
+    });
+    expect(config).toMatchObject({
+      models: { jev: JEV_ACCESS.vercelGatewayModel },
+      jev: { accessMode: JEV_ACCESS.vercelGateway, baseURL: JEV_ACCESS.vercelGatewayBaseUrl },
+      credentials: { jevApiKey: 'gateway-test-key' },
+      billing: { jevCostAttested: true },
+    });
+    expect(
+      loadConfig({
+        JEV_ACCESS_MODE: 'vercel-gateway',
+        JEV_MODEL: JEV_ACCESS.vercelGatewayModel,
+      }).models.jev,
+    ).toBe(JEV_ACCESS.vercelGatewayModel);
+    expect(() => loadConfig({ JEV_ACCESS_MODE: 'vercel-gateway', JEV_MODEL: 'other-provider/model' })).toThrow(
+      'JEV_MODEL',
+    );
+  });
+
   it('rejects token whitespace without disclosing supplied values', () => {
     const token = 'synthetic secret';
     expect(() => loadConfig({ EXECUTION_MODE: 'production', MASTRA_API_TOKEN: token })).toThrow(
@@ -58,10 +81,12 @@ describe('execution configuration', () => {
       'CANDIDATES_PER_SOURCE',
       'JEV_BUDGET_USD',
       'OPENAI_BUDGET_USD',
+      'AI_GATEWAY_API_KEY',
     ]) {
       vi.stubEnv(key, undefined);
     }
     vi.stubEnv('EXECUTION_MODE', 'local');
+    vi.stubEnv('JEV_ACCESS_MODE', 'direct');
     vi.stubEnv('SOURCE_CONCURRENCY', '2');
     vi.stubEnv('JEV_MODEL', 'test-model-id');
     expect(loadConfig()).toMatchObject({ sources: { concurrency: 2 }, models: { jev: 'test-model-id' } });

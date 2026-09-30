@@ -7,6 +7,13 @@ export const PROJECT_BUDGET_USD = {
   openai: 5,
 } as const;
 
+export const JEV_ACCESS = {
+  direct: 'direct',
+  vercelGateway: 'vercel-gateway',
+  vercelGatewayBaseUrl: 'https://ai-gateway.vercel.sh/typesafe/v1',
+  vercelGatewayModel: 'typesafe-ai/jev',
+} as const;
+
 // Reference tariff only; verify actual billing before paid work. No environment overrides.
 export const PRICING_REFERENCE = {
   checkedAt: '2026-09-27',
