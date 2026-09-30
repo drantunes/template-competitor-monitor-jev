@@ -29,6 +29,27 @@ export function createCompetitorMonitorWorkflow(
       'Safely collects configured public competitor sources and persists immutable evidence for later review.',
     inputSchema: monitorInputSchema,
     outputSchema: workflowOutputSchema,
+    options: {
+      onError: async ({ runId, logger }) => {
+        try {
+          await dependencies.store.finishInterruptedNativeRun(runId, 'failed', 'WORKFLOW_FAILED');
+        } catch {
+          // Native workflow error remains primary; startup recovery can retry database cleanup.
+          logger.error('MONITOR_LIFECYCLE_CLEANUP_FAILED');
+        }
+      },
+      onFinish: async ({ runId, status, logger }) => {
+        try {
+          await dependencies.store.finishInterruptedNativeRun(
+            runId,
+            status === 'failed' || status === 'tripwire' ? 'failed' : 'partial',
+            status === 'canceled' ? 'CANCELED' : 'WORKFLOW_INTERRUPTED',
+          );
+        } catch {
+          logger.error('MONITOR_LIFECYCLE_CLEANUP_FAILED');
+        }
+      },
+    },
     ...(schedules.length ? { schedule: schedules } : {}),
   })
     .then(createPrepareStep(context))

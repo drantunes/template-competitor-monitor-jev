@@ -6,7 +6,7 @@ import { Mastra } from '@mastra/core/mastra';
 import { createScorer } from '@mastra/core/evals';
 import { LibSQLStore } from '@mastra/libsql';
 import { expectEvals } from '@mastra/evals/vitest';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
 import { loadConfig } from '../src/mastra/config';
@@ -100,6 +100,67 @@ async function sourceOutcome(store: MonitorStore, runId: string) {
 }
 
 describe('native workflow and durable application store', () => {
+  it('fatal_workflow_failure_releases_owned_lock_and_allows_retry', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'competitor-monitor-fatal-'));
+    const config = loadConfig({
+      MONITOR_DATABASE_URL: `file:${join(directory, 'monitor.db')}`,
+      MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
+    });
+    const store = MonitorStore.open(config.storage.monitorUrl);
+    stores.push(store);
+    await runRegisteredWorkflow(store, config, () => html('$19'));
+    await runRegisteredWorkflow(store, config, () => html('$29'));
+    const pending = await store.pendingCandidatesForSource('monitor-a', 'pricing-page');
+    expect(pending).toHaveLength(1);
+    const other = await store.beginRun('other-monitor', 'other-native-run');
+    const pendingRead = vi
+      .spyOn(store, 'pendingCandidatesForSource')
+      .mockRejectedValueOnce(new Error('TRANSIENT_STORE_READ'));
+    const cleanup = vi
+      .spyOn(store, 'finishInterruptedNativeRun')
+      .mockRejectedValueOnce(new Error('TRANSIENT_CLEANUP_FAILURE'));
+    const failed = await startRegisteredWorkflow(store, config, () => html('$29'));
+    expect(cleanup).toHaveBeenCalledTimes(2);
+    cleanup.mockRestore();
+    expect(failed.status).toBe('failed');
+    expect(JSON.stringify(failed)).toContain('TRANSIENT_STORE_READ');
+    pendingRead.mockRestore();
+    const rows = await store.client.execute(
+      "SELECT status FROM monitor_runs WHERE monitor_id = 'monitor-a' ORDER BY started_at DESC LIMIT 1",
+    );
+    expect(rows.rows[0]?.status).toBe('failed');
+    expect(
+      (await store.client.execute("SELECT * FROM monitor_locks WHERE monitor_id = 'monitor-a'")).rows,
+    ).toHaveLength(0);
+    expect((await store.pendingCandidatesForSource('monitor-a', 'pricing-page')).map(item => item.candidateId)).toEqual(
+      pending.map(item => item.candidateId),
+    );
+    await expect(store.beginRun('other-monitor')).rejects.toThrow('MONITOR_BUSY');
+    const invalid = await startRegisteredWorkflow(store, config, () => html('$29'), {
+      ...sourceInput(),
+      monitorId: 'other-monitor',
+      sources: [sourceInput().sources[0], sourceInput().sources[0]],
+    });
+    expect(invalid.status).toBe('failed');
+    expect(JSON.stringify(invalid)).toContain('DUPLICATE_SOURCE_ID');
+    const busy = await startRegisteredWorkflow(store, config, () => html('$29'), {
+      ...sourceInput(),
+      monitorId: 'other-monitor',
+    });
+    expect(busy.status).toBe('failed');
+    expect(JSON.stringify(busy)).toContain('MONITOR_BUSY');
+    await expect(store.beginRun('other-monitor')).rejects.toThrow('MONITOR_BUSY');
+    const healthy = await runRegisteredWorkflow(store, config, () => html('$29'));
+    expect(healthy.status).toBe('partial');
+    await store.finishInterruptedNativeRun('other-native-run', 'failed', 'TEST_CLEANUP');
+    // A repeated old callback must leave the new owner untouched.
+    const replacement = await store.beginRun('other-monitor', 'replacement-native-run');
+    await store.finishInterruptedNativeRun('other-native-run', 'failed', 'TEST_REPLAY');
+    await expect(store.beginRun('other-monitor')).rejects.toThrow('MONITOR_BUSY');
+    await store.finishRun(replacement, 'success', {});
+    expect((await store.runForNativeWorkflowRunId('other-native-run'))?.runId).toBe(other.id);
+  });
+
   it('retains every overflow candidate and its warning through native workflow restart', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'competitor-monitor-overflow-'));
     const config = loadConfig({

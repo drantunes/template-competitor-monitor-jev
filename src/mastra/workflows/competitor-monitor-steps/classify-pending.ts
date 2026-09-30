@@ -79,6 +79,7 @@ export function createClassifyPendingStep(context: StepContext) {
                 return classifier;
               },
               abortSignal,
+              runId: processed.runId,
             });
             if (!outcome) return stopForCancellation();
             changes.push(outcome);

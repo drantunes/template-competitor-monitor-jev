@@ -1,5 +1,6 @@
 {
   "name": "template-competitor-monitor-jev",
+  "description": "Monitor public competitor pages with native Mastra workflows, Jev classification, and exact change evidence.",
   "version": "0.1.0",
   "private": true,
   "type": "module",

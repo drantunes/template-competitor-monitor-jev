@@ -15,175 +15,209 @@ import { createCompetitorMonitorAgent } from '../src/mastra/monitor-agent';
 import { createCompetitorMonitorWorkflow } from '../src/mastra/workflows/competitor-monitor-workflow';
 import { EVALUATION_FIXTURES } from './fixtures/evaluation-dataset';
 
-it.each(['generate', 'stream'] as const)(
-  'executes the native monitor from chat using %s and preserves comparison history',
-  async method => {
-    const directory = await mkdtemp(join(tmpdir(), 'competitor-monitor-chat-'));
-    const config = loadConfig({
-      MONITOR_DATABASE_URL: `file:${join(directory, 'monitor.db')}`,
-      MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
-      TYPESAFE_AI_API_KEY: 'synthetic',
-    });
-    const store = MonitorStore.open(config.storage.monitorUrl);
-    const framework = new LibSQLStore({ id: 'chat-test', url: config.storage.mastraUrl });
-    let price = '$19';
-    let classifications = 0;
-    const fixture = EVALUATION_FIXTURES.find(item => item.family === 'pricing')!;
-    const workflow = createCompetitorMonitorWorkflow({
-      store,
-      config,
-      resolver: async () => [{ address: '93.184.216.34', family: 4 }],
-      transport: async ({ url }) => ({
-        status: 200,
-        headers: { 'content-type': url.pathname === '/robots.txt' ? 'text/plain' : 'text/html' },
-        body: new TextEncoder().encode(
-          url.pathname === '/robots.txt'
-            ? 'User-agent: *\nAllow: /'
-            : `<main><h1>Pricing</h1><p>Starter costs ${price}.</p><p>${'Public product pricing and documentation details for customers. '.repeat(15)}</p></main>`,
-        ),
-      }),
-    });
-    const inputData = {
-      monitorId: 'example-product',
-      runMode: 'manual',
-      profile: { name: 'Example product', interests: ['pricing'] },
-      sources: [{ id: 'pricing', label: 'Pricing', url: 'https://public.example/pricing', kind: 'pricing' }],
-      options: { generateSummary: false, includeUnchangedSources: true },
-    };
-    let modelCalls = 0;
-    const model = new MastraLanguageModelV2Mock({
-      doGenerate: async () => {
-        const call = modelCalls++;
-        return {
-          content:
-            call % 2 === 0
-              ? [
-                  {
-                    type: 'tool-call' as const,
-                    toolCallId: `monitor-${call}`,
-                    toolName: 'workflow-competitorMonitor',
-                    input: JSON.stringify({ inputData }),
-                  },
-                ]
-              : [{ type: 'text' as const, text: 'Monitor result received.' }],
-          finishReason: call % 2 === 0 ? 'tool-calls' : 'stop',
-          usage: { inputTokens: 10, outputTokens: 10, totalTokens: 20 },
-          warnings: [],
-        };
-      },
-      doStream: async () => {
-        const call = modelCalls++;
-        const chunks =
+it.each(['generate', 'stream'] as const)('chat_follow_up_uses_supplied_monitor_history (%s)', async method => {
+  const directory = await mkdtemp(join(tmpdir(), 'competitor-monitor-chat-'));
+  const config = loadConfig({
+    MONITOR_DATABASE_URL: `file:${join(directory, 'monitor.db')}`,
+    MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
+    TYPESAFE_AI_API_KEY: 'synthetic',
+  });
+  const store = MonitorStore.open(config.storage.monitorUrl);
+  const framework = new LibSQLStore({ id: 'chat-test', url: config.storage.mastraUrl });
+  let price = '$19';
+  let classifications = 0;
+  const fixture = EVALUATION_FIXTURES.find(item => item.family === 'pricing')!;
+  const workflow = createCompetitorMonitorWorkflow({
+    store,
+    config,
+    resolver: async () => [{ address: '93.184.216.34', family: 4 }],
+    transport: async ({ url }) => ({
+      status: 200,
+      headers: { 'content-type': url.pathname === '/robots.txt' ? 'text/plain' : 'text/html' },
+      body: new TextEncoder().encode(
+        url.pathname === '/robots.txt'
+          ? 'User-agent: *\nAllow: /'
+          : `<main><h1>Pricing</h1><p>Starter costs ${price}.</p><p>${'Public product pricing and documentation details for customers. '.repeat(15)}</p></main>`,
+      ),
+    }),
+  });
+  const inputData = {
+    monitorId: 'example-product',
+    runMode: 'manual',
+    profile: { name: 'Example product', interests: ['pricing'] },
+    sources: [{ id: 'pricing', label: 'Pricing', url: 'https://public.example/pricing', kind: 'pricing' }],
+    options: { generateSummary: false, includeUnchangedSources: true },
+  };
+  let modelCalls = 0;
+  let conversation: any[] = [];
+  let nextInput = inputData;
+  const followUpPrompts: string[] = [];
+  function inputFromHistory(options: { prompt: unknown }) {
+    const prompt = JSON.stringify(options.prompt);
+    const genericFollowUp = conversation.length > 0;
+    if (genericFollowUp && modelCalls % 2 === 0) {
+      expect(prompt).toContain('Check the same pages again.');
+      expect(prompt).toContain('workflow-competitorMonitor');
+      expect(prompt).toContain('example-product');
+      expect(prompt).toContain('https://public.example/pricing');
+      // Infer the next call from the actual supplied tool-call history, not a fixture captured out of band.
+      const previousCall = (options.prompt as any[])
+        .flatMap(message => (Array.isArray(message.content) ? message.content : []))
+        .filter(part => part.type === 'tool-call' && part.toolName === 'workflow-competitorMonitor')
+        .at(-1);
+      expect(previousCall).toBeDefined();
+      const previous = typeof previousCall.input === 'string' ? JSON.parse(previousCall.input) : previousCall.input;
+      nextInput = previous.inputData;
+      expect(nextInput).toMatchObject({
+        monitorId: 'example-product',
+        sources: [{ id: 'pricing', url: 'https://public.example/pricing' }],
+      });
+      followUpPrompts.push(prompt);
+    }
+  }
+  const model = new MastraLanguageModelV2Mock({
+    doGenerate: async options => {
+      inputFromHistory(options);
+      const call = modelCalls++;
+      return {
+        content:
           call % 2 === 0
             ? [
                 {
                   type: 'tool-call' as const,
                   toolCallId: `monitor-${call}`,
                   toolName: 'workflow-competitorMonitor',
-                  input: JSON.stringify({ inputData }),
+                  input: JSON.stringify({ inputData: nextInput }),
                 },
               ]
-            : [
-                { type: 'text-start' as const, id: 'reply' },
-                { type: 'text-delta' as const, id: 'reply', delta: 'Monitor result received.' },
-                { type: 'text-end' as const, id: 'reply' },
-              ];
+            : [{ type: 'text' as const, text: 'Monitor result received.' }],
+        finishReason: call % 2 === 0 ? 'tool-calls' : 'stop',
+        usage: { inputTokens: 10, outputTokens: 10, totalTokens: 20 },
+        warnings: [],
+      };
+    },
+    doStream: async options => {
+      inputFromHistory(options);
+      const call = modelCalls++;
+      const chunks =
+        call % 2 === 0
+          ? [
+              {
+                type: 'tool-call' as const,
+                toolCallId: `monitor-${call}`,
+                toolName: 'workflow-competitorMonitor',
+                input: JSON.stringify({ inputData: nextInput }),
+              },
+            ]
+          : [
+              { type: 'text-start' as const, id: 'reply' },
+              { type: 'text-delta' as const, id: 'reply', delta: 'Monitor result received.' },
+              { type: 'text-end' as const, id: 'reply' },
+            ];
+      return {
+        stream: new ReadableStream({
+          start(controller) {
+            for (const chunk of chunks) controller.enqueue(chunk);
+            controller.enqueue({
+              type: 'finish',
+              finishReason: call % 2 === 0 ? 'tool-calls' : 'stop',
+              usage: { inputTokens: 10, outputTokens: 10, totalTokens: 20 },
+            });
+            controller.close();
+          },
+        }),
+      };
+    },
+  });
+  const agent = createCompetitorMonitorAgent(workflow, model);
+  const classifier = new Classifier({
+    id: CLASSIFIER_ID,
+    questions: COMPETITOR_CHANGE_QUESTIONS,
+    model: {
+      specificationVersion: 'v4',
+      provider: 'fixture',
+      modelId: 'fixture',
+      supportedQuestionTypes: ['choice', 'score', 'boolean'],
+      doEvaluate: async () => {
+        classifications++;
         return {
-          stream: new ReadableStream({
-            start(controller) {
-              for (const chunk of chunks) controller.enqueue(chunk);
-              controller.enqueue({
-                type: 'finish',
-                finishReason: call % 2 === 0 ? 'tool-calls' : 'stop',
-                usage: { inputTokens: 10, outputTokens: 10, totalTokens: 20 },
-              });
-              controller.close();
+          answers: {
+            ...fixture.answers!,
+            change_type: {
+              ...fixture.answers!.change_type,
+              probabilities: Object.fromEntries(
+                Object.keys(COMPETITOR_CHANGE_QUESTIONS.change_type.criteria).map(choice => [
+                  choice,
+                  choice === 'pricing' ? 1 : 0,
+                ]),
+              ),
             },
-          }),
+          },
+          usage: {},
+          warnings: [],
+          rounding: {},
+          providerMetadata: fixture.providerMetadata,
+          response: { modelId: 'fixture', timestamp: new Date() },
         };
       },
+    } as any,
+  });
+  const mastra = new Mastra({
+    agents: { competitorMonitor: agent },
+    workflows: { competitorMonitor: workflow },
+    classifiers: { competitorChange: classifier },
+    storage: framework,
+  });
+  async function check() {
+    const activeAgent = mastra.getAgent('competitorMonitor');
+    const userMessage = {
+      role: 'user' as const,
+      content: conversation.length
+        ? 'Check the same pages again.'
+        : 'Check Example product pricing at https://public.example/pricing.',
+    };
+    const supplied = [...conversation, userMessage];
+    const result = method === 'generate' ? await activeAgent.generate(supplied) : await activeAgent.stream(supplied);
+    if (method === 'stream') await (result as Awaited<ReturnType<typeof activeAgent.stream>>).consumeStream();
+    expect(await result.text).toBe('Monitor result received.');
+    const response = await result.response;
+    conversation = [...supplied, ...(response.messages ?? [])];
+    const steps = await result.steps;
+    const toolResult = steps
+      .flatMap(step => step.toolResults)
+      .find(item => item.payload.toolName === 'workflow-competitorMonitor');
+    expect(toolResult).toBeDefined();
+    return (
+      toolResult!.payload.result as {
+        result: {
+          status: string;
+          counts: { candidatesClassified: number };
+          changes: Array<{ evidence?: { beforeExcerpt: string; afterExcerpt: string } }>;
+        };
+      }
+    ).result;
+  }
+  try {
+    const baseline = await check();
+    expect(baseline.status).toBe('success');
+    expect(classifications).toBe(0);
+    price = '$29';
+    const changed = await check();
+    expect(changed.counts.candidatesClassified).toBe(1);
+    expect(changed.changes[0]?.evidence).toMatchObject({
+      beforeExcerpt: 'Starter costs $19.',
+      afterExcerpt: 'Starter costs $29.',
     });
-    const agent = createCompetitorMonitorAgent(workflow, model);
-    const classifier = new Classifier({
-      id: CLASSIFIER_ID,
-      questions: COMPETITOR_CHANGE_QUESTIONS,
-      model: {
-        specificationVersion: 'v4',
-        provider: 'fixture',
-        modelId: 'fixture',
-        supportedQuestionTypes: ['choice', 'score', 'boolean'],
-        doEvaluate: async () => {
-          classifications++;
-          return {
-            answers: {
-              ...fixture.answers!,
-              change_type: {
-                ...fixture.answers!.change_type,
-                probabilities: Object.fromEntries(
-                  Object.keys(COMPETITOR_CHANGE_QUESTIONS.change_type.criteria).map(choice => [
-                    choice,
-                    choice === 'pricing' ? 1 : 0,
-                  ]),
-                ),
-              },
-            },
-            usage: {},
-            warnings: [],
-            rounding: {},
-            providerMetadata: fixture.providerMetadata,
-            response: { modelId: 'fixture', timestamp: new Date() },
-          };
-        },
-      } as any,
-    });
-    const mastra = new Mastra({
-      agents: { competitorMonitor: agent },
-      workflows: { competitorMonitor: workflow },
-      classifiers: { competitorChange: classifier },
-      storage: framework,
-    });
-    async function check() {
-      const activeAgent = mastra.getAgent('competitorMonitor');
-      const result =
-        method === 'generate'
-          ? await activeAgent.generate('Check Example product pricing at https://public.example/pricing.')
-          : await activeAgent.stream('Check Example product pricing at https://public.example/pricing.');
-      if (method === 'stream') await (result as Awaited<ReturnType<typeof activeAgent.stream>>).consumeStream();
-      expect(await result.text).toBe('Monitor result received.');
-      const steps = await result.steps;
-      const toolResult = steps
-        .flatMap(step => step.toolResults)
-        .find(item => item.payload.toolName === 'workflow-competitorMonitor');
-      expect(toolResult).toBeDefined();
-      return (
-        toolResult!.payload.result as {
-          result: {
-            status: string;
-            counts: { candidatesClassified: number };
-            changes: Array<{ evidence?: { beforeExcerpt: string; afterExcerpt: string } }>;
-          };
-        }
-      ).result;
-    }
-    try {
-      const baseline = await check();
-      expect(baseline.status).toBe('success');
-      expect(classifications).toBe(0);
-      price = '$29';
-      const changed = await check();
-      expect(changed.counts.candidatesClassified).toBe(1);
-      expect(changed.changes[0]?.evidence).toMatchObject({
-        beforeExcerpt: 'Starter costs $19.',
-        afterExcerpt: 'Starter costs $29.',
-      });
-      expect(classifications).toBe(1);
-      const unchanged = await check();
-      expect(unchanged.status).toBe('no_change');
-      expect(classifications).toBe(1);
-      expect((await store.client.execute('SELECT * FROM classification_decisions')).rows).toHaveLength(1);
-    } finally {
-      await store.close();
-      await framework.close();
-    }
-  },
-);
+    expect(classifications).toBe(1);
+    const unchanged = await check();
+    expect(unchanged.status).toBe('no_change');
+    expect(classifications).toBe(1);
+    expect(followUpPrompts).toHaveLength(2);
+    expect(followUpPrompts[1]).toContain('Starter costs $19.');
+    expect(followUpPrompts[1]).toContain('Starter costs $29.');
+    expect((await store.client.execute('SELECT * FROM classification_decisions')).rows).toHaveLength(1);
+  } finally {
+    await store.close();
+    await framework.close();
+  }
+});

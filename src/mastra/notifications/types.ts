@@ -1,6 +1,7 @@
 import type { ReportChange } from '../lib/reporting';
 
 export type ChangeNotification = {
+  eventId: string;
   runId: string;
   monitorId: string;
   monitorName: string;
@@ -8,7 +9,7 @@ export type ChangeNotification = {
   changes: ReportChange[];
 };
 
-/** Implement this contract for email, an API, a Mastra Channel, or another destination. */
+/** Destinations must deduplicate eventId if replay after delivery but before its durable receipt matters. */
 export interface NotificationProvider {
   id: string;
   notify(event: ChangeNotification): Promise<void>;

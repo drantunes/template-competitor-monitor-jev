@@ -119,7 +119,7 @@ export const runModeSchema = z
   .enum(['baseline', 'manual', 'scheduled'])
   .default('manual')
   .describe(
-    'baseline = capture missing baselines only; manual = compare/classify without notifications; scheduled = compare/classify and notify for new changes.',
+    'baseline = capture missing baselines only; manual = compare/classify without notifications; scheduled = compare/classify and deliver pending decision notifications, including recovered changes.',
   );
 
 const boundedProbability = z.number().finite().min(RUBRIC.minProbability).max(RUBRIC.maxProbability);

@@ -26,6 +26,7 @@ export async function classifyCandidate({
   dependencies,
   getClassifier,
   abortSignal,
+  runId,
 }: {
   candidate: PendingCandidate;
   source: MonitorSource;
@@ -33,6 +34,7 @@ export async function classifyCandidate({
   dependencies: Dependencies;
   getClassifier: () => Classifier<typeof COMPETITOR_CHANGE_QUESTIONS> | undefined;
   abortSignal: AbortSignal;
+  runId: string;
 }) {
   const state = classificationState({
     evidence: candidate,
@@ -87,6 +89,17 @@ export async function classifyCandidate({
       reportedModel: result.response.modelId,
       verifiedModel: undefined,
     },
+    ...(input.runMode === 'scheduled'
+      ? {
+          notification: {
+            runId,
+            monitorId: input.monitorId,
+            monitorName: input.profile.name,
+            sourceId: source.id,
+            providerIds: (dependencies.notificationProviders ?? []).map(provider => provider.id),
+          },
+        }
+      : {}),
   });
   return {
     id: candidate.candidateId,

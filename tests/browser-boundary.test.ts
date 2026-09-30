@@ -86,6 +86,64 @@ async function observeCdpMessages<T>(operation: () => Promise<T>, usePageWorld =
 afterEach(async () => Promise.allSettled(closers.splice(0).map(close => close())));
 
 describe('real Chrome browser egress boundary', () => {
+  it('renders_extensionless_modules_with_validated_content_type', async () => {
+    const transported: string[] = [];
+    const transport: PinnedTransport = async ({ url }) => {
+      transported.push(url.pathname);
+      return {
+        status: 200,
+        headers: {
+          'content-type': url.pathname === '/module' ? 'application/javascript; charset=utf-8' : 'text/javascript',
+        },
+        body: Buffer.from(
+          url.pathname === '/module'
+            ? "import { evidence } from '/dependency.mjs'; document.querySelector('#evidence').textContent = evidence;"
+            : "export const evidence = 'Starter plan now costs $29, with exact rendered module evidence.';",
+        ),
+      };
+    };
+    const result = await renderPublicPage(
+      {
+        url: 'https://public.example/main',
+        status: 200,
+        contentType: 'text/html',
+        retries: 0,
+        durationMs: 0,
+        html: '<main><h1>Pricing</h1><p id="evidence">Loading...</p><script type="module" src="/module"></script></main>',
+      },
+      { resolver: publicDns, transport },
+    );
+    expect(result.html).toContain('Starter plan now costs $29, with exact rendered module evidence.');
+    expect(transported).toEqual(['/module', '/dependency.mjs']);
+  }, 30_000);
+
+  it.each(['', 'text/plain', 'application/javascript-invalid'])(
+    'does not execute a module with unvalidated MIME %j',
+    async contentType => {
+      const result = await renderPublicPage(
+        {
+          url: 'https://public.example/main',
+          status: 200,
+          contentType: 'text/html',
+          retries: 0,
+          durationMs: 0,
+          html: '<main><p id="evidence">Original evidence</p><script type="module" src="/module"></script></main>',
+        },
+        {
+          resolver: publicDns,
+          transport: async () => ({
+            status: 200,
+            headers: { 'content-type': contentType },
+            body: Buffer.from("document.querySelector('#evidence').textContent = 'Injected evidence';"),
+          }),
+        },
+      );
+      expect(result.html).toContain('Original evidence');
+      expect(result.html).not.toContain('Injected evidence');
+    },
+    30_000,
+  );
+
   it('blocks_browser_private_subrequests', async () => {
     const targetRequests: string[] = [];
     let udpMessages = 0;
@@ -196,6 +254,7 @@ describe('real Chrome browser egress boundary', () => {
       {
         url: 'https://public.example/main',
         status: 200,
+        contentType: 'text/html',
         retries: 0,
         durationMs: 0,
         html: '<main><h1>Browser boundary</h1><script src="/rebind.js?first"></script></main>',
@@ -215,6 +274,7 @@ describe('real Chrome browser egress boundary', () => {
         {
           url: 'https://public.example/form',
           status: 200,
+          contentType: 'text/html',
           retries: 0,
           durationMs: 0,
           html: '<main><h1>Form boundary</h1><script src="/form.js"></script></main>',
@@ -252,6 +312,7 @@ describe('real Chrome browser egress boundary', () => {
         {
           url: 'https://public.example/burst',
           status: 200,
+          contentType: 'text/html',
           retries: 0,
           durationMs: 0,
           html: '<main><h1>Browser resource burst</h1><script src="/burst.js"></script></main>',
@@ -293,6 +354,7 @@ describe('real Chrome browser egress boundary', () => {
         {
           url: 'https://public.example/burst-bytes',
           status: 200,
+          contentType: 'text/html',
           retries: 0,
           durationMs: 0,
           html: '<main><h1>Browser byte burst</h1><script src="/burst-bytes.js"></script></main>',
@@ -311,6 +373,7 @@ describe('real Chrome browser egress boundary', () => {
     const page = {
       url: 'https://public.example/dom-amplification',
       status: 200,
+      contentType: 'text/html',
       retries: 0,
       durationMs: 0,
       html: `<main><h1>DOM amplification</h1><script>globalThis.TextEncoder = class { encode() { return { byteLength: 0 } } }; document.body.append('x'.repeat(${3 * 1024 * 1024}))</script></main>`,
@@ -350,6 +413,7 @@ describe('real Chrome browser egress boundary', () => {
       {
         url: 'https://public.example/inline',
         status: 200,
+        contentType: 'text/html',
         retries: 0,
         durationMs: 0,
         html: "<main><h1>Inline</h1><script>document.body.insertAdjacentHTML('beforeend', '<p>inline bootstrap rendered</p>')</script></main>",
@@ -360,6 +424,7 @@ describe('real Chrome browser egress boundary', () => {
       {
         url: 'https://public.example/module',
         status: 200,
+        contentType: 'text/html',
         retries: 0,
         durationMs: 0,
         html: '<main><h1>Module</h1><script type="module" src="/bootstrap.mjs"></script></main>',
@@ -387,6 +452,7 @@ describe('real Chrome browser egress boundary', () => {
         {
           url: 'https://public.example/navigation',
           status: 200,
+          contentType: 'text/html',
           retries: 0,
           durationMs: 0,
           html: '<main><h1>Navigation</h1><script src="/nav.js"></script></main>',

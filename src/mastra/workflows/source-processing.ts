@@ -80,10 +80,12 @@ export async function processSource(
     if (storedIdentity && (storedIdentity.url !== normalizedUrl || storedIdentity.profile !== profile)) {
       throw new Error('SOURCE_ID_REBOUND');
     }
-    await withinDeadline(assertRobotsAllowed(normalizedUrl, { ...dependencies, abortSignal: acquisitionSignal }));
-    throwIfCanceled();
     let acquired = await withinDeadline(
-      fetchPublicPage(normalizedUrl, { ...dependencies, abortSignal: acquisitionSignal }),
+      fetchPublicPage(normalizedUrl, {
+        ...dependencies,
+        abortSignal: acquisitionSignal,
+        beforeRequest: url => assertRobotsAllowed(url.href, { ...dependencies, abortSignal: acquisitionSignal }),
+      }),
     );
     acquisitionCompleted = true;
     let content: NormalizedContent | undefined;

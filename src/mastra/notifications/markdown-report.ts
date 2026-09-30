@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdir, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { ChangeNotification, NotificationProvider } from './types';
@@ -18,6 +18,7 @@ export function formatMarkdownReport(event: ChangeNotification) {
     `Date: ${event.date}`,
     `Monitor: ${event.monitorId}`,
     `Run: ${event.runId}`,
+    `Event: ${event.eventId}`,
     '',
   ];
   for (const change of event.changes) {
@@ -42,7 +43,7 @@ export function formatMarkdownReport(event: ChangeNotification) {
   return `${lines.join('\n')}\n`;
 }
 
-/** Example provider: one idempotent Markdown report per changed scheduled run. */
+/** Example provider: one idempotent Markdown report per immutable decision event. */
 export class MarkdownReportProvider implements NotificationProvider {
   readonly id = 'markdown-report';
 
@@ -50,12 +51,14 @@ export class MarkdownReportProvider implements NotificationProvider {
 
   async notify(event: ChangeNotification) {
     await mkdir(this.directory, { recursive: true });
-    const key = createHash('sha256').update(`${event.monitorId}\0${event.runId}`).digest('hex');
+    const key = createHash('sha256').update(event.eventId).digest('hex');
     const path = join(this.directory, `${key}.md`);
+    const temporary = join(this.directory, `.${key}.${randomUUID()}.tmp`);
     try {
-      await writeFile(path, formatMarkdownReport(event), { flag: 'wx' });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      await writeFile(temporary, formatMarkdownReport(event), { flag: 'wx' });
+      await rename(temporary, path);
+    } finally {
+      await rm(temporary, { force: true });
     }
   }
 }

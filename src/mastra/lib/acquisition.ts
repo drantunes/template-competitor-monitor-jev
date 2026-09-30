@@ -21,7 +21,14 @@ export type PinnedTransport = (request: {
   timeoutMs: number;
   abortSignal?: AbortSignal;
 }) => Promise<TransportResponse>;
-export type AcquiredPage = { url: string; status: number; html: string; retries: number; durationMs: number };
+export type AcquiredPage = {
+  url: string;
+  status: number;
+  html: string;
+  contentType: string;
+  retries: number;
+  durationMs: number;
+};
 
 export class AcquisitionError extends Error {
   constructor(
@@ -174,6 +181,7 @@ export async function fetchPublicPage(
     transport?: PinnedTransport;
     acceptedContentTypes?: RegExp;
     abortSignal?: AbortSignal;
+    beforeRequest?: (url: URL) => Promise<void>;
   } = {},
 ): Promise<AcquiredPage> {
   const resolver = options.resolver ?? systemResolver;
@@ -191,6 +199,7 @@ export async function fetchPublicPage(
     if (Date.now() - startedAt > TIMING.acquisitionDeadlineMs) throw new AcquisitionError('ACQUISITION_TIMEOUT', true);
     if (url.hostname.toLowerCase() !== allowedHost) throw new AcquisitionError('UNSAFE_REDIRECT_HOST');
     const address = await resolvePinned(url, resolver);
+    await options.beforeRequest?.(url);
     if (options.abortSignal?.aborted) throw new AcquisitionError('ACQUISITION_CANCELED');
     let response: TransportResponse;
     try {
@@ -239,13 +248,22 @@ export async function fetchPublicPage(
     if (response.status < HTTP_STATUS.successMin || response.status >= HTTP_STATUS.successMaxExclusive) {
       throw new AcquisitionError(`HTTP_${response.status}`);
     }
-    const contentType = header(response, 'content-type') ?? '';
-    const acceptedContentTypes = options.acceptedContentTypes ?? /text\/html|application\/xhtml\+xml/i;
+    const contentType = (header(response, 'content-type') ?? '').split(';')[0]!.trim().toLowerCase();
+    const acceptedContentTypes = options.acceptedContentTypes ?? /^(?:text\/html|application\/xhtml\+xml)$/i;
+    if (!/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(contentType))
+      throw new AcquisitionError('INVALID_CONTENT_TYPE');
     if (!acceptedContentTypes.test(contentType)) throw new AcquisitionError('INVALID_CONTENT_TYPE');
     if (response.body.byteLength > SOURCE_LIMITS.maxHtmlBytes) throw new AcquisitionError('RESPONSE_TOO_LARGE');
     const html = new TextDecoder().decode(response.body);
     if (!html.trim()) throw new AcquisitionError('EMPTY_RESPONSE');
-    return { url: url.toString(), status: response.status, html, retries, durationMs: Date.now() - startedAt };
+    return {
+      url: url.toString(),
+      status: response.status,
+      html,
+      contentType,
+      retries,
+      durationMs: Date.now() - startedAt,
+    };
   }
   throw new AcquisitionError('TOO_MANY_REDIRECTS');
 }
@@ -257,7 +275,7 @@ export async function assertRobotsAllowed(
   const url = new URL(pageUrl);
   const robotsUrl = new URL('/robots.txt', url).toString();
   try {
-    const robots = await fetchPublicPage(robotsUrl, { ...options, acceptedContentTypes: /text\/plain/i });
+    const robots = await fetchPublicPage(robotsUrl, { ...options, acceptedContentTypes: /^text\/plain$/i });
     const parser = robotsParser(robots.url, robots.html);
     if (!parser.isAllowed(pageUrl, 'competitor-monitor-jev')) throw new AcquisitionError('ROBOTS_DENIED');
   } catch (error) {

@@ -3,32 +3,27 @@ import { createStep } from '@mastra/core/workflows';
 import type { MonitorInput } from '../../schemas';
 import { workflowOutputSchema, type MonitorRunResult, type StepContext } from './workflow-context';
 
-/** Final step: fan out changed scheduled runs, then persist the result and release the monitor lock. */
+/** Final step: drain durable scheduled deliveries, then persist the result and release the monitor lock. */
 export function createNotifyStep(context: StepContext) {
   const { dependencies } = context;
   return createStep({
     id: 'notify-competitor-changes',
-    description: 'Invokes enabled notification providers only for scheduled runs with detected changes.',
+    description: 'Invokes enabled notification providers for pending decisions during scheduled runs.',
     inputSchema: workflowOutputSchema,
     outputSchema: workflowOutputSchema,
     execute: async ({ inputData, getInitData }) => {
       const input = getInitData<MonitorInput>();
       const failures: string[] = [];
-      if (input.runMode === 'scheduled' && inputData.changes.length > 0) {
-        const newIds = new Set(await dependencies.store.candidateIdsForRun(inputData.runId));
-        const changes = inputData.changes.filter(change => newIds.has(change.id));
-        const event = {
-          runId: inputData.runId,
-          monitorId: inputData.monitorId,
-          monitorName: input.profile.name,
-          date: new Date().toISOString(),
-          changes,
-        };
-        for (const provider of changes.length ? (dependencies.notificationProviders ?? []) : []) {
-          try {
-            await provider.notify(event);
-          } catch {
-            failures.push(provider.id);
+      if (input.runMode === 'scheduled') {
+        for (const provider of dependencies.notificationProviders ?? []) {
+          const events = await dependencies.store.pendingNotifications(input.monitorId, provider.id);
+          for (const event of events) {
+            try {
+              await provider.notify(event);
+              await dependencies.store.acknowledgeNotification(event.eventId, provider.id);
+            } catch {
+              if (!failures.includes(provider.id)) failures.push(provider.id);
+            }
           }
         }
       }
