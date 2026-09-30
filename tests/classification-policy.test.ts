@@ -20,7 +20,7 @@ import {
 import type { Evidence } from '../src/mastra/lib/content';
 import { createLocalObservability } from '../src/mastra/lib/observability';
 import { MonitorStore } from '../src/mastra/lib/store';
-import { loadConfig } from '../src/mastra/config';
+import { JEV_ACCESS, loadConfig } from '../src/mastra/config';
 import { createCompetitorMonitorWorkflow } from '../src/mastra/workflows/competitor-monitor-workflow';
 import type { MonitorInput } from '../src/mastra/schemas';
 
@@ -153,9 +153,12 @@ async function monitoredWorkflow(
 describe('auditable classifier policy', () => {
   it('batches_six_questions_and_preserves_native_metadata', async () => {
     let request: any;
+    let endpoint = '';
     const provider = createTypeSafeAi({
       apiKey: 'synthetic-key',
-      fetch: async (_url, init) => {
+      baseURL: JEV_ACCESS.vercelGatewayBaseUrl,
+      fetch: async (url, init) => {
+        endpoint = String(url);
         request = JSON.parse(String(init?.body));
         return new Response(
           JSON.stringify({
@@ -204,7 +207,7 @@ describe('auditable classifier policy', () => {
     });
     const classifier = new Classifier({
       id: 'test',
-      model: provider.evaluationModel('jev-latest'),
+      model: provider.evaluationModel(JEV_ACCESS.vercelGatewayModel),
       questions: COMPETITOR_CHANGE_QUESTIONS,
     });
     const result = await classifier.evaluate({ state: { evidence: 'public text' }, maxRetries: 0 });
@@ -213,6 +216,7 @@ describe('auditable classifier policy', () => {
     expect(result.answers.relevance.score).toBe(2.5);
     expect(result.providerMetadata?.typesafe).toMatchObject({ confidence: { change_type: 0.9 } });
     expect(result.response.modelId).toBe('jev-verified-test');
+    expect(endpoint).toBe(`${JEV_ACCESS.vercelGatewayBaseUrl}/systemone`);
   });
 
   it('routes_policy_boundaries_and_uncertainty', () => {
