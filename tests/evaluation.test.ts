@@ -36,7 +36,7 @@ type WorkflowProof = {
 
 let workflowProof: WorkflowProof;
 
-describe('F5 evaluation dataset and reporting', () => {
+describe('Workflow evaluation dataset and reporting', () => {
   beforeAll(async () => {
     workflowProof = await runWorkflowProof();
   });
@@ -94,7 +94,7 @@ describe('F5 evaluation dataset and reporting', () => {
 });
 
 async function runWorkflowProof(): Promise<WorkflowProof> {
-  const directory = await mkdtemp(join(tmpdir(), 'f5-product-eval-'));
+  const directory = await mkdtemp(join(tmpdir(), 'product-eval-'));
   const config = loadConfig({
     MONITOR_DATABASE_URL: `file:${join(directory, 'monitor.db')}`,
     MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
@@ -192,14 +192,14 @@ async function runWorkflowProof(): Promise<WorkflowProof> {
       };
     },
   });
-  const framework = new LibSQLStore({ id: 'f5-product-eval', url: config.storage.mastraUrl });
+  const framework = new LibSQLStore({ id: 'product-eval', url: config.storage.mastraUrl });
   const mastra = new Mastra({
     storage: framework,
     workflows: { competitorMonitor: workflow },
     classifiers: { competitorChange: classifier },
   });
   const inputFor = (fixture: EvaluationFixture) => ({
-    monitorId: `f5-product-eval-${fixture.id}`,
+    monitorId: `product-eval-${fixture.id}`,
     runMode: 'manual' as const,
     profile: {
       name: 'Evaluator',
@@ -234,7 +234,7 @@ async function runWorkflowProof(): Promise<WorkflowProof> {
     }
     useAfterSnapshots = true;
     const gate = createScorer({
-      id: 'f5-product-workflow-route',
+      id: 'product-workflow-route',
       description: 'The persisted public workflow result reports the labeled alert route.',
       type: { input: z.any(), output: z.any() },
     }).generateScore(({ run }) => {
@@ -277,7 +277,7 @@ async function runWorkflowProof(): Promise<WorkflowProof> {
       sql: `SELECT p.source_id, p.evidence_json, c.decision_json
               FROM pending_evidence p JOIN classification_decisions c ON c.candidate_id = p.id
               WHERE p.monitor_id LIKE ?`,
-      args: ['f5-product-eval-%'],
+      args: ['product-eval-%'],
     });
     expect(persisted.rows).toHaveLength(routableFixtures.length);
     const fixtureById = new Map(routableFixtures.map(fixture => [fixture.id, fixture]));
@@ -298,7 +298,7 @@ async function runWorkflowProof(): Promise<WorkflowProof> {
     const spending = new TestSpendingLedger(store.client);
     const knownReservation = await spending.reserveProviderBudget({
       provider: 'jev',
-      candidateId: 'f5-report-known',
+      candidateId: 'report-known',
       amountUsd: 0.01,
       ceilingUsd: PROJECT_BUDGET_USD.jev,
     });
@@ -308,7 +308,7 @@ async function runWorkflowProof(): Promise<WorkflowProof> {
     ).toBe(true);
     const unresolvedReservation = await spending.reserveProviderBudget({
       provider: 'jev',
-      candidateId: 'f5-report-unresolved',
+      candidateId: 'report-unresolved',
       amountUsd: 0.01,
       ceilingUsd: PROJECT_BUDGET_USD.jev,
     });

@@ -21,7 +21,8 @@
     "test:reports": "vitest run --no-file-parallelism tests/report-schedule.test.ts tests/notification-output.test.ts",
     "test:evaluation": "vitest run tests/evaluation.test.ts",
     "test:live-evaluation": "vitest run --no-file-parallelism tests/live-evaluation.test.ts",
-    "test:f5": "vitest run --no-file-parallelism tests/evaluation.test.ts tests/live-evaluation.test.ts"
+    "test:verification": "vitest run --no-file-parallelism tests/evaluation.test.ts tests/live-evaluation.test.ts",
+    "postbuild": "node scripts/prepare-build-dependencies.mjs"
   },
   "dependencies": {
     "@ai-sdk/typesafe-ai": "3.0.9",
@@ -45,5 +46,12 @@
     "prettier": "3.9.9",
     "typescript": "5.9.3",
     "vitest": "4.1.11"
+  },
+  "overrides": {
+    "@browserbasehq/stagehand@3.7.3": {
+      "@ai-sdk/provider-utils@3": {
+        "undici@^5.29.0": "6.28.1"
+      }
+    }
   }
 }

@@ -171,7 +171,7 @@ export class MonitorStore {
         PRIMARY KEY (event_id, provider_id)
       );
     `);
-    // Older F1 databases store only normalized content. Keep those immutable rows readable and add
+    // Older databases store only normalized content. Keep those immutable rows readable and add
     // optional metadata for new snapshots instead of rebuilding or rewriting the table.
     const snapshotColumns = await this.client.execute('PRAGMA table_info(snapshots)');
     if (!snapshotColumns.rows.some(row => String(row.name) === 'acquisition_json')) {

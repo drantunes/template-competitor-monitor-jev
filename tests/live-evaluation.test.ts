@@ -35,11 +35,11 @@ afterEach(async () => {
 });
 
 function liveInput(): MonitorInput {
-  const raw = process.env.F5_LIVE_INPUT_JSON;
-  expect(raw, 'F5_LIVE_INPUT_JSON must contain the documented real-source monitor input').toBeTruthy();
+  const raw = process.env.LIVE_MONITOR_INPUT_JSON;
+  expect(raw, 'LIVE_MONITOR_INPUT_JSON must contain the documented real-source monitor input').toBeTruthy();
   const input = validateMonitorInput(JSON.parse(raw!));
   expect(new Set(input.sources.map(source => source.kind))).toEqual(new Set(['pricing', 'changelog', 'documentation']));
-  expect(input.options.generateSummary, 'F5 live selectors do not configure a summary agent').toBe(false);
+  expect(input.options.generateSummary, 'Live selectors do not configure a summary agent').toBe(false);
   return input;
 }
 
@@ -96,8 +96,8 @@ function createLiveClassifier(config: ReturnType<typeof loadConfig>) {
 }
 
 async function verifyManualStudioSmoke(config: ReturnType<typeof loadConfig>, input: MonitorInput) {
-  const raw = process.env.F5_MANUAL_STUDIO_SMOKE_RECORD_JSON;
-  expect(raw, 'F5_MANUAL_STUDIO_SMOKE_RECORD_JSON must contain the retained Studio run record').toBeTruthy();
+  const raw = process.env.MANUAL_STUDIO_SMOKE_RECORD_JSON;
+  expect(raw, 'MANUAL_STUDIO_SMOKE_RECORD_JSON must contain the retained Studio run record').toBeTruthy();
   const record = JSON.parse(raw!) as Record<string, unknown>;
   expect(typeof record.nativeWorkflowRunId).toBe('string');
   expect(typeof record.monitorId).toBe('string');
@@ -107,7 +107,7 @@ async function verifyManualStudioSmoke(config: ReturnType<typeof loadConfig>, in
   expect(Date.parse(String(record.observedAt))).toBeLessThanOrEqual(Date.now());
   expect(record.monitorId).toBe(input.monitorId);
   const source = input.sources.find(item => item.id === record.sourceId);
-  expect(source, 'Smoke record source must be in F5_LIVE_INPUT_JSON').toBeTruthy();
+  expect(source, 'Smoke record source must be in LIVE_MONITOR_INPUT_JSON').toBeTruthy();
   expect(record.sourceUrl).toBe(new URL(source!.url).toString());
   const smokeSources = Array.isArray(record.sources) ? record.sources : [];
   const smokeSource = smokeSources.find(
@@ -142,7 +142,7 @@ async function verifyManualStudioSmoke(config: ReturnType<typeof loadConfig>, in
  * This selector is intentionally separate from offline fixtures. It never substitutes
  * synthetic acquisition, baseline, or classifier output for a live demonstration.
  */
-describe('F5 live evaluation prerequisites', () => {
+describe('Live evaluation prerequisites', () => {
   it(
     'npm_quickstart_runs_demo_workflow',
     async () => {
@@ -172,7 +172,7 @@ describe('F5 live evaluation prerequisites', () => {
 
       const classifier = createLiveClassifier(config);
       const workflow = createCompetitorMonitorWorkflow({ store: monitorStore, config });
-      frameworkStore = new LibSQLStore({ id: 'f5-live-evaluation', url: config.storage.mastraUrl });
+      frameworkStore = new LibSQLStore({ id: 'live-evaluation', url: config.storage.mastraUrl });
       const mastra = new Mastra({
         storage: frameworkStore,
         workflows: { competitorMonitor: workflow },
@@ -210,10 +210,10 @@ describe('F5 live evaluation prerequisites', () => {
       const input = liveInput();
       await verifyManualStudioSmoke(config, input);
       expect(config.credentials.jevApiKey, 'The selected Jev access mode requires its configured API key').toBeTruthy();
-      const cases = JSON.parse(process.env.F5_LIVE_EVALUATION_CASES_JSON ?? '[]') as Array<any>;
+      const cases = JSON.parse(process.env.LIVE_EVALUATION_CASES_JSON ?? '[]') as Array<any>;
       expect(
         cases.length,
-        'F5_LIVE_EVALUATION_CASES_JSON must contain labeled held-out operator-supplied evidence',
+        'LIVE_EVALUATION_CASES_JSON must contain labeled held-out operator-supplied evidence',
       ).toBeGreaterThan(0);
       expect(cases.length).toBeLessThanOrEqual(SOURCE_LIMITS.maxCandidatesPerSource);
       const seenIds = new Set<string>();
@@ -317,7 +317,7 @@ describe('F5 live evaluation prerequisites', () => {
         },
       });
       console.info(
-        'F5_LIVE_EVALUATION_REPORT',
+        'LIVE_EVALUATION_REPORT',
         JSON.stringify({
           datasetVersion: report.datasetVersion,
           questionSetVersion: report.questionSetVersion,

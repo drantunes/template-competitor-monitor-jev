@@ -1,3 +1,6 @@
+import { execFile } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { promisify } from 'node:util';
 import { createSocket } from 'node:dgram';
 import { createServer } from 'node:http';
 import type { Socket } from 'node:net';
@@ -86,6 +89,85 @@ async function observeCdpMessages<T>(operation: () => Promise<T>, usePageWorld =
 afterEach(async () => Promise.allSettled(closers.splice(0).map(close => close())));
 
 describe('real Chrome browser egress boundary', () => {
+  it('stagehand_download_uses_compatible_undici', async () => {
+    const stagehandRequire = createRequire(createRequire(import.meta.url).resolve('@browserbasehq/stagehand'));
+    const providerUtilsPath = stagehandRequire.resolve('@ai-sdk/provider-utils');
+    // A fresh Node process retains Node's native global fetch. Public test-endpoint requests exercise
+    // the real overridden Agent; a test-only DNS hook deterministically proves its private-IP denial.
+    const { stdout } = await promisify(execFile)(
+      process.execPath,
+      [
+        '--input-type=commonjs',
+        '-e',
+        `
+      const assert = require('node:assert/strict');
+      const { createRequire } = require('node:module');
+      const dns = require('node:dns');
+      const { createServer } = require('node:http');
+      const nativeFetch = globalThis.fetch;
+      const providerRequire = createRequire(process.argv[1]);
+      const undici = providerRequire('undici');
+      assert.equal(providerRequire('undici/package.json').version, '6.28.1');
+      const originalUndiciFetch = undici.fetch;
+      let dispatched = 0;
+      undici.fetch = (...args) => { dispatched += 1; return originalUndiciFetch(...args); };
+      const originalLookup = dns.lookup;
+      let deniedLookups = 0;
+      dns.lookup = (hostname, options, callback) => {
+        if (hostname === 'private-download.example') {
+          deniedLookups += 1;
+          return callback(null, [{ address: '127.0.0.1', family: 4 }]);
+        }
+        return originalLookup(hostname, options, callback);
+      };
+      const { fetchWithValidatedRedirects, readResponseWithSizeLimit } = providerRequire(process.argv[1]);
+      const server = createServer((_request, response) => response.end('private target'));
+      let privateConnections = 0;
+      server.on('connection', socket => { privateConnections += 1; socket.destroy(); });
+      server.listen(0, '127.0.0.1', async () => {
+        try {
+          const port = server.address().port;
+          const fetchUrl = url => fetchWithValidatedRedirects({ url, abortSignal: AbortSignal.timeout(15000) });
+          const publicUrl = 'https://httpbingo.org/base64/U3RhZ2VoYW5kIGRvd25sb2FkIGV2aWRlbmNlLg==';
+          const response = await fetchUrl(publicUrl);
+          assert.equal(response.status, 200);
+          const bytes = await readResponseWithSizeLimit({ response, url: publicUrl, maxBytes: 4096 });
+          assert.equal(Buffer.from(bytes).toString(), 'Stagehand download evidence.');
+          const oversized = await fetchUrl(publicUrl);
+          await assert.rejects(readResponseWithSizeLimit({ response: oversized, url: publicUrl, maxBytes: 8 }), /maximum size/);
+          await assert.rejects(fetchUrl('http://127.0.0.1:' + port), /not allowed/);
+          await assert.rejects(fetchUrl('http://private-download.example:' + port), error =>
+            /disallowed IP address/.test(String(error.cause ?? error)));
+          const redirectUrl = 'https://httpbin.org/redirect-to?url=' + encodeURIComponent('http://127.0.0.1:' + port);
+          await assert.rejects(fetchUrl(redirectUrl), /not allowed/);
+          assert.equal(deniedLookups, 1);
+          assert.equal(privateConnections, 0);
+          assert.equal(globalThis.fetch, nativeFetch);
+          assert.equal(dispatched, 4);
+          console.log(JSON.stringify({ publicDownload: true, sizeBound: true, privateDenied: true, redirectDenied: true, dispatched }));
+        } catch (error) {
+          console.error(error);
+          process.exitCode = 1;
+        } finally {
+          dns.lookup = originalLookup;
+          undici.fetch = originalUndiciFetch;
+          server.close(() => process.exit(process.exitCode ?? 0));
+        }
+      });
+    `,
+        providerUtilsPath,
+      ],
+      { timeout: 55000, maxBuffer: 16384 },
+    );
+    expect(JSON.parse(stdout)).toEqual({
+      publicDownload: true,
+      sizeBound: true,
+      privateDenied: true,
+      redirectDenied: true,
+      dispatched: 4,
+    });
+  }, 60_000);
+
   it('renders_extensionless_modules_with_validated_content_type', async () => {
     const transported: string[] = [];
     const transport: PinnedTransport = async ({ url }) => {

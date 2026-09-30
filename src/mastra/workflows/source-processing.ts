@@ -1,7 +1,15 @@
+import { isDeepStrictEqual } from 'node:util';
+
 import { SOURCE_LIMITS, TIMING } from '../config';
 import { assertRobotsAllowed, fetchPublicPage } from '../lib/acquisition';
 import { renderPublicPage } from '../lib/browser';
-import { diffContent, normalizeHtml, NORMALIZATION_VERSION, type NormalizedContent } from '../lib/content';
+import {
+  contentForCurrentNormalization,
+  diffContent,
+  normalizeHtml,
+  NORMALIZATION_VERSION,
+  type NormalizedContent,
+} from '../lib/content';
 import type { SnapshotAcquisition } from '../lib/store';
 import { normalizedSourceUrl, type MonitorInput, type MonitorSource } from '../schemas';
 import type { Dependencies, MonitorRunResult } from './competitor-monitor-steps/workflow-context';
@@ -44,6 +52,23 @@ function shortRenderShell(content: NormalizedContent, html: string, minimumConte
   );
 }
 
+function equivalentNormalizationProfile(stored: string, current: string) {
+  try {
+    const previous = JSON.parse(stored);
+    const next = JSON.parse(current);
+    if (!previous || typeof previous !== 'object' || Array.isArray(previous)) return false;
+    const { version, ...options } = previous;
+    const { version: currentVersion, ...currentOptions } = next;
+    return (
+      typeof version === 'string' &&
+      (version === currentVersion || /^[a-zA-Z][0-9]+-semantic-v2$/.test(version)) &&
+      isDeepStrictEqual(options, currentOptions)
+    );
+  } catch {
+    return false;
+  }
+}
+
 export async function processSource(
   input: MonitorInput,
   runId: string,
@@ -77,7 +102,10 @@ export async function processSource(
       ignoreSelectors: source.ignoreSelectors,
       minContentChars: source.minContentChars,
     });
-    if (storedIdentity && (storedIdentity.url !== normalizedUrl || storedIdentity.profile !== profile)) {
+    if (
+      storedIdentity &&
+      (storedIdentity.url !== normalizedUrl || !equivalentNormalizationProfile(storedIdentity.profile, profile))
+    ) {
       throw new Error('SOURCE_ID_REBOUND');
     }
     let acquired = await withinDeadline(
@@ -186,7 +214,11 @@ export async function processSource(
         source: { sourceId: source.id, status: 'unchanged', acquisitionCompleted, outcome: 'BASELINE_ALREADY_EXISTS' },
       };
     }
-    if (baseline.content.hash === content.hash) {
+    const baselineContent =
+      storedIdentity && JSON.parse(storedIdentity.profile).version !== NORMALIZATION_VERSION
+        ? contentForCurrentNormalization(baseline.content)
+        : baseline.content;
+    if (baselineContent.hash === content.hash) {
       throwIfCanceled();
       const pendingIds = await dependencies.store.pendingIdsForSource(input.monitorId, source.id);
       return {
@@ -198,7 +230,7 @@ export async function processSource(
         },
       };
     }
-    const evidence = diffContent(baseline.content, content);
+    const evidence = diffContent(baselineContent, content);
     const candidateLimit = input.policy.maxCandidatesPerSource ?? dependencies.config.sources.candidatesPerSource;
     const warnings = evidence.length > candidateLimit ? ['CANDIDATE_LIMIT'] : [];
     throwIfCanceled();

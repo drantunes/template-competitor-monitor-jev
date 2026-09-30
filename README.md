@@ -93,6 +93,8 @@ Here `config` comes from the template configuration, `workflow` is the existing 
 - **Recurring checks:** the scheduler is disabled by default. Add real monitor inputs to the ignored `scheduled-monitors.json` file and set `ENABLE_MONITOR_SCHEDULER=true` as described below. Mastra then registers one schedule per monitor on startup. A long-lived Mastra process must stay running for daily checks.
 - **Production mode:** set `EXECUTION_MODE=production` and a nonblank `MASTRA_API_TOKEN` for native SimpleAuth protection. The static token has no expiry; rotate it by changing the value and restarting. Local mode binds to `127.0.0.1`.
 
+For a production build, run `npm run build`, then `npm start`. The npm postbuild lifecycle preserves the scoped Stagehand security override in the generated installation; keep that lifecycle when adapting build commands.
+
 ### Accepted values
 
 The workflow input contract is in [`src/mastra/schemas.ts`](src/mastra/schemas.ts). Its enumerated fields are:

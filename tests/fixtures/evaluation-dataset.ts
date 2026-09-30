@@ -1,7 +1,7 @@
 import type { Evidence } from '../../src/mastra/lib/content';
 import type { ClassificationRoute } from '../../src/mastra/lib/classification';
 
-export const EVALUATION_DATASET_VERSION = 'f5-competitor-change-v1';
+export const EVALUATION_DATASET_VERSION = 'competitor-change-v1';
 
 type Answers = {
   change_type: { type: 'choice'; choice: string; probabilities: Record<string, number> };
