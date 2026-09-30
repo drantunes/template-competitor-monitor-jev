@@ -552,14 +552,13 @@ describe('native workflow and durable application store', () => {
     await reopened.finishRun(recovered, 'success', {});
   });
 
-  it('does not reserve provider budget when the registered classifier is absent', async () => {
+  it('retains pending evidence when the registered classifier is absent', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'competitor-monitor-missing-classifier-'));
     const config = loadConfig({
       MONITOR_DATABASE_URL: `file:${join(directory, 'monitor.db')}`,
       MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
       TYPESAFE_AI_API_KEY: 'synthetic-key',
       JEV_MODEL: 'jev-fixture',
-      JEV_COST_ATTESTATION: 'typesafe-jev-2026-09-27:jev-fixture',
     });
     const store = MonitorStore.open(config.storage.monitorUrl);
     stores.push(store);
@@ -568,7 +567,7 @@ describe('native workflow and durable application store', () => {
     expect(changed.changes).toEqual([
       expect.objectContaining({ status: 'failed', reason: 'CLASSIFICATION_PROVIDER_FAILURE' }),
     ]);
-    expect(await store.reservedProviderUsd('jev')).toBe(0);
+    expect(await store.pendingCandidatesForSource('monitor-a', 'pricing-page')).toHaveLength(1);
   });
 
   it('adds optional acquisition metadata without rewriting an existing snapshot JSON record', async () => {

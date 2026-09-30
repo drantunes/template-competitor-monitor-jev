@@ -9,8 +9,9 @@ describe('execution configuration', () => {
   it('defaults to local loopback without provider credentials', () => {
     expect(loadConfig({})).toMatchObject({
       executionMode: 'local',
+      schedule: { enabled: false },
       server: { host: '127.0.0.1', apiToken: undefined },
-      sources: { maxSources: 20, concurrency: 3, candidatesPerSource: 20 },
+      sources: { maxSources: 3, concurrency: 3, candidatesPerSource: 20 },
       models: {
         jev: 'jev-latest',
         summary: 'openai/gpt-6-luna',
@@ -18,7 +19,6 @@ describe('execution configuration', () => {
         summaryMaxInputTokens: 8_000,
         summaryMaxOutputTokens: 800,
       },
-      budgetUsd: { jev: 4.5, openai: 5 },
     });
   });
 
@@ -27,6 +27,12 @@ describe('execution configuration', () => {
     expect(
       loadConfig({ EXECUTION_MODE: 'local', MASTRA_API_TOKEN: 'synthetic-token' }).server.apiToken,
     ).toBeUndefined();
+  });
+
+  it('enables the scheduler only with an explicit true value', () => {
+    expect(loadConfig({ ENABLE_MONITOR_SCHEDULER: 'true' }).schedule.enabled).toBe(true);
+    expect(loadConfig({ ENABLE_MONITOR_SCHEDULER: 'false' }).schedule.enabled).toBe(false);
+    expect(() => loadConfig({ ENABLE_MONITOR_SCHEDULER: 'yes' })).toThrow('ENABLE_MONITOR_SCHEDULER');
   });
 
   it.each(['', ' ', 'staging', 'Production', ' production'])('rejects invalid mode %j', mode => {
@@ -48,13 +54,11 @@ describe('execution configuration', () => {
     const config = loadConfig({
       JEV_ACCESS_MODE: 'vercel-gateway',
       AI_GATEWAY_API_KEY: 'gateway-test-key',
-      JEV_COST_ATTESTATION: 'vercel-ai-gateway-typesafe-2026-09-29:typesafe-ai/jev',
     });
     expect(config).toMatchObject({
       models: { jev: JEV_ACCESS.vercelGatewayModel },
       jev: { accessMode: JEV_ACCESS.vercelGateway, baseURL: JEV_ACCESS.vercelGatewayBaseUrl },
       credentials: { jevApiKey: 'gateway-test-key' },
-      billing: { jevCostAttested: true },
     });
     expect(
       loadConfig({
@@ -120,13 +124,10 @@ describe('bounded overrides', () => {
       MAX_SOURCES: '10',
       SOURCE_CONCURRENCY: '5',
       CANDIDATES_PER_SOURCE: '50',
-      JEV_BUDGET_USD: '1.25',
-      OPENAI_BUDGET_USD: '2.5',
       JEV_MODEL: 'test-model-id',
     });
     expect(loadConfig(environment)).toMatchObject({
       sources: { maxSources: 10, concurrency: 5, candidatesPerSource: 50 },
-      budgetUsd: { jev: 1.25, openai: 2.5 },
       models: { jev: 'test-model-id' },
     });
     expect(loadConfig({}).sources.concurrency).toBe(3);
@@ -146,21 +147,15 @@ describe('bounded overrides', () => {
     ['MAX_SOURCES', '21'],
     ['SOURCE_CONCURRENCY', '6'],
     ['CANDIDATES_PER_SOURCE', '51'],
-    ['JEV_BUDGET_USD', '4.5001'],
-    ['OPENAI_BUDGET_USD', '5.0001'],
   ])('rejects %s above its approved ceiling', (key, value) => {
     expect(() => loadConfig({ [key]: value })).toThrow(key);
   });
 
-  it.each(['JEV_BUDGET_USD', 'OPENAI_BUDGET_USD'])('rejects invalid monetary overrides for %s', key => {
-    for (const value of ['', ' ', 'NaN', 'Infinity', '-Infinity', '-0.01', 'abc']) {
-      expect(() => loadConfig({ [key]: value }), `${key}=${JSON.stringify(value)}`).toThrow(key);
-    }
-  });
-
-  it('allows disabling either provider without transferring its budget', () => {
-    expect(loadConfig({ JEV_BUDGET_USD: '0' }).budgetUsd).toEqual({ jev: 0, openai: 5 });
-    expect(loadConfig({ OPENAI_BUDGET_USD: '0' }).budgetUsd).toEqual({ jev: 4.5, openai: 0 });
+  it('ignores retired test spending variables in ordinary operation', () => {
+    const config = loadConfig({ JEV_BUDGET_USD: '0', OPENAI_BUDGET_USD: 'invalid', TYPESAFE_AI_API_KEY: 'synthetic' });
+    expect(config.credentials.jevApiKey).toBe('synthetic');
+    expect(config).not.toHaveProperty('budgetUsd');
+    expect(config).not.toHaveProperty('billing');
   });
 
   it.each(['', ' '])('rejects a blank Jev model (%j)', value => {
@@ -168,8 +163,8 @@ describe('bounded overrides', () => {
   });
 
   it('reports invalid variable names without reflecting their values', () => {
-    expect(() => loadConfig({ MAX_SOURCES: 'private-value', OPENAI_BUDGET_USD: 'private-value' })).toThrow(
-      /^Invalid configuration: MAX_SOURCES, OPENAI_BUDGET_USD$/,
+    expect(() => loadConfig({ MAX_SOURCES: 'private-value', SOURCE_CONCURRENCY: 'private-value' })).toThrow(
+      /^Invalid configuration: MAX_SOURCES, SOURCE_CONCURRENCY$/,
     );
   });
 });

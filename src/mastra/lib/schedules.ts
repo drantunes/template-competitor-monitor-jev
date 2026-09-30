@@ -6,11 +6,11 @@ import type { MonitorStore } from './store';
 
 const WORKFLOW_ID = 'competitor-monitor';
 
-/** Opt-in native schedule setup. Stable ids are reconciled with the native CRUD API, never duplicated. */
-export async function ensureWeeklyMonitorSchedule(
+/** Optional programmatic setup; configured monitors use declarative schedules at boot. */
+export async function ensureDailyMonitorSchedule(
   mastra: Mastra,
   input: MonitorInput,
-  scheduleId = `${input.monitorId}-weekly`,
+  scheduleId = `${input.monitorId}-daily`,
 ) {
   const existing = (await mastra.schedules.list({ workflowId: WORKFLOW_ID })).find(
     schedule => schedule.metadata?.monitorId === input.monitorId,

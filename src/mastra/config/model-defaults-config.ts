@@ -3,7 +3,7 @@ const SUMMARY_FIXED_INPUT_TOKEN_RESERVE = 4_000;
 export const MODEL_DEFAULTS = {
   // Alias, not a reproducible pin. JEV_MODEL may select a verified nonempty model ID.
   jev: 'jev-latest',
-  // Approved evidence-to-prose model; no automatic substitution or env override.
+  // Model for short evidence summaries; no automatic substitution.
   summary: 'openai/gpt-6-luna',
   // Approved reasoning setting for short structured summaries; no env override.
   summaryReasoning: 'none',
@@ -37,9 +37,20 @@ export const EVAL_DEFAULTS = {
   calibrationPairs: 12,
   // Labeled held-out pairs; positive integer seed, excluded from calibration.
   heldOutPairs: 12,
-  // Concurrent live evaluations; fixed at one to keep project spending sequential.
+  // Concurrent live evaluations; fixed at one for repeatable observations.
   concurrency: 1,
 } as const;
 
-// Example native schedule only; importing configuration never creates a schedule.
-export const SCHEDULE_DEFAULTS = { cron: '0 9 * * 1', timezone: 'UTC' } as const;
+// Once real monitor inputs are configured, Mastra registers one daily schedule per monitor at boot.
+export const SCHEDULE_DEFAULTS = { cron: '0 9 * * *', timezone: 'UTC' } as const;
+
+export const CHAT_DEFAULTS = {
+  // Provider retries per chat request; disabled to surface failures without automatic redispatch.
+  maxRetries: 0,
+  model: MODEL_DEFAULTS.summary,
+  reasoning: MODEL_DEFAULTS.summaryReasoning,
+  // Agent steps per message, including the workflow invocation and the reply.
+  maxSteps: 5,
+  // Tokens per reply; allows a concise report with source links.
+  maxOutputTokens: 2_000,
+} as const;

@@ -49,7 +49,7 @@ export function createFinalizeStep(context: StepContext) {
   const { dependencies } = context;
   return createStep({
     id: 'finalize-competitor-run',
-    description: 'Aggregates source statuses and releases the same-monitor lock after durable run completion.',
+    description: 'Aggregates source statuses and builds the grounded run report.',
     inputSchema: classifiedSourcesSchema,
     outputSchema: workflowOutputSchema,
     execute: async ({ inputData, getInitData }) => {
@@ -58,7 +58,6 @@ export function createFinalizeStep(context: StepContext) {
       const first = processed[0]!;
       const input = getInitData<MonitorInput>();
       const report = await buildReport({
-        runId: first.runId,
         changes: inputData.changes,
         generateSummary: input.options.generateSummary ?? true,
         config: dependencies.config,
@@ -82,11 +81,6 @@ export function createFinalizeStep(context: StepContext) {
         changes: report.changes,
         report: { summary: report.summary, summaryFailure: report.summaryFailure },
       };
-      await dependencies.store.finishRun(
-        { id: first.runId, monitorId: first.monitorId, status: 'running', startedAt: '' },
-        finalStatus === 'no_change' ? 'success' : finalStatus,
-        result,
-      );
       return result;
     },
   });

@@ -1,6 +1,7 @@
 import type { ClassifierQuestions } from '@mastra/core/classifier';
 
-import { CLASSIFICATION_LIMITS, POLICY_DEFAULTS, PRICING_REFERENCE, RUBRIC, SOURCE_LIMITS, TIMING } from '../config';
+import { POLICY_DEFAULTS, RUBRIC, SOURCE_LIMITS, TIMING } from '../config';
+import { INTEREST_DEFINITIONS, type MonitorInterest } from '../schemas';
 import type { Evidence } from './content';
 
 export const CLASSIFIER_ID = 'competitor-change-classifier';
@@ -29,7 +30,8 @@ export const COMPETITOR_CHANGE_QUESTIONS = {
   },
   relevance: {
     type: 'score',
-    instructions: 'Score relevance to the supplied operator interests from 0 through 4.',
+    instructions:
+      'Score relevance to the supplied operator interests from 0 through 4. Use interestDefinitions for each selected topic and consider organizationContext, prioritySignals, and ignoredSignals as context, not hard filters.',
     criteria: ['Unrelated', 'Weak match', 'Clear limited match', 'Priority topic', 'Critical priority signal'],
   },
   business_impact: {
@@ -148,7 +150,7 @@ function decision(
 export function classificationState(input: {
   evidence: Evidence;
   source: { id: string; label: string; url: string; kind: string };
-  interests: string[];
+  interests: MonitorInterest[];
   prioritySignals: string[];
   ignoredSignals: string[];
   organizationContext?: string;
@@ -161,6 +163,10 @@ export function classificationState(input: {
       kind: input.source.kind,
     },
     interests: input.interests,
+    interestDefinitions: input.interests.map(interest => ({
+      interest,
+      meaning: INTEREST_DEFINITIONS[interest],
+    })),
     prioritySignals: input.prioritySignals,
     ignoredSignals: input.ignoredSignals,
     ...(input.organizationContext === undefined ? {} : { organizationContext: input.organizationContext }),
@@ -174,11 +180,6 @@ export function classificationState(input: {
   if (JSON.stringify(state).length > SOURCE_LIMITS.maxCandidateStateChars) throw new Error('CANDIDATE_STATE_LIMIT');
   return state;
 }
-
-/** A whole native call may make maxRetries additional billed requests; output is published as free. */
-export const JEV_RESERVATION_USD =
-  ((TIMING.maxRetries + 1) * CLASSIFICATION_LIMITS.jevMaxInputTokens * PRICING_REFERENCE.jevInputUsdPerMillion) /
-  PRICING_REFERENCE.tokensPerPricingUnit;
 
 export function classificationAbortSignal(signal: AbortSignal) {
   return AbortSignal.any([signal, AbortSignal.timeout(TIMING.jevCallMs)]);

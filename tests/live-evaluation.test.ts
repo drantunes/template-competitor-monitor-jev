@@ -1,22 +1,21 @@
+import {
+  CLASSIFICATION_LIMITS,
+  PRICING_REFERENCE,
+  PROJECT_BUDGET_USD,
+  JEV_TEST_CALL_RESERVATION_USD,
+} from './provider-spending-config';
+import { TestSpendingLedger } from './provider-spending-ledger';
 import { createTypeSafeAi } from '@ai-sdk/typesafe-ai';
 import { Classifier } from '@mastra/core/classifier';
 import { Mastra } from '@mastra/core/mastra';
 import { LibSQLStore } from '@mastra/libsql';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import {
-  CLASSIFICATION_LIMITS,
-  PRICING_REFERENCE,
-  PROJECT_BUDGET_USD,
-  SOURCE_LIMITS,
-  TIMING,
-  loadConfig,
-} from '../src/mastra/config';
+import { SOURCE_LIMITS, TIMING, loadConfig } from '../src/mastra/config';
 import {
   classificationState,
   COMPETITOR_CHANGE_QUESTIONS,
   CLASSIFIER_ID,
-  JEV_RESERVATION_USD,
   QUESTION_SET_VERSION,
   RULE_VERSION,
   routeClassification,
@@ -45,13 +44,55 @@ function liveInput(): MonitorInput {
 }
 
 function createLiveClassifier(config: ReturnType<typeof loadConfig>) {
-  return new Classifier({
-    id: CLASSIFIER_ID,
-    model: createTypeSafeAi({ apiKey: config.credentials.jevApiKey!, baseURL: config.jev.baseURL }).evaluationModel(
-      config.models.jev,
-    ),
-    questions: COMPETITOR_CHANGE_QUESTIONS,
-  });
+  const expectedAttestation =
+    config.jev.accessMode === 'vercel-gateway'
+      ? `vercel-ai-gateway-typesafe-2026-09-29:${config.models.jev}`
+      : `typesafe-jev-2026-09-27:${config.models.jev}`;
+  expect(process.env.JEV_COST_ATTESTATION, 'Paid tests require a verified tariff').toBe(expectedAttestation);
+  const model = createTypeSafeAi({
+    apiKey: config.credentials.jevApiKey!,
+    baseURL: config.jev.baseURL,
+  }).evaluationModel(config.models.jev);
+  const spending = new TestSpendingLedger(monitorStore!.client);
+  const guardedModel: typeof model = {
+    specificationVersion: model.specificationVersion,
+    provider: model.provider,
+    supportedQuestionTypes: model.supportedQuestionTypes,
+    modelId: model.modelId,
+    async doEvaluate(options) {
+      // Native retries call this method again; each attempted provider call reserves independently.
+      const id = await spending.reserveProviderBudget({
+        provider: 'jev',
+        candidateId: 'live-test-evaluation',
+        amountUsd: JEV_TEST_CALL_RESERVATION_USD,
+        ceilingUsd: PROJECT_BUDGET_USD.jev,
+      });
+      if (!id) throw new Error('TEST_JEV_BUDGET_EXHAUSTED');
+      const result = await model.doEvaluate(options);
+      const { inputTokens, outputTokens } = result.usage ?? {};
+      if (
+        typeof inputTokens === 'number' &&
+        typeof outputTokens === 'number' &&
+        Number.isSafeInteger(inputTokens) &&
+        Number.isSafeInteger(outputTokens) &&
+        inputTokens >= 0 &&
+        outputTokens >= 0
+      ) {
+        await spending.settleProviderReservation({
+          id,
+          knownAmountUnits: Math.ceil(
+            ((inputTokens * PRICING_REFERENCE.jevInputUsdPerMillion +
+              outputTokens * PRICING_REFERENCE.jevOutputUsdPerMillion) /
+              PRICING_REFERENCE.tokensPerPricingUnit) *
+              CLASSIFICATION_LIMITS.usdReservationUnits,
+          ),
+          unresolvedUnits: 0,
+        });
+      }
+      return result;
+    },
+  };
+  return new Classifier({ id: CLASSIFIER_ID, model: guardedModel, questions: COMPETITOR_CHANGE_QUESTIONS });
 }
 
 async function verifyManualStudioSmoke(config: ReturnType<typeof loadConfig>, input: MonitorInput) {
@@ -119,7 +160,6 @@ describe('F5 live evaluation prerequisites', () => {
       const input = liveInput();
       await verifyManualStudioSmoke(config, input);
       expect(config.credentials.jevApiKey, 'The selected Jev access mode requires its configured API key').toBeTruthy();
-      expect(config.billing.jevCostAttested, 'JEV_COST_ATTESTATION must match the configured live model').toBe(true);
       monitorStore ??= MonitorStore.open(config.storage.monitorUrl);
       await monitorStore.init();
       const previousBaselines = new Map(
@@ -170,7 +210,6 @@ describe('F5 live evaluation prerequisites', () => {
       const input = liveInput();
       await verifyManualStudioSmoke(config, input);
       expect(config.credentials.jevApiKey, 'The selected Jev access mode requires its configured API key').toBeTruthy();
-      expect(config.billing.jevCostAttested, 'JEV_COST_ATTESTATION must match the configured live model').toBe(true);
       const cases = JSON.parse(process.env.F5_LIVE_EVALUATION_CASES_JSON ?? '[]') as Array<any>;
       expect(
         cases.length,
@@ -214,13 +253,6 @@ describe('F5 live evaluation prerequisites', () => {
       let completeInputUsage = true;
       let completeOutputUsage = true;
       for (const { item, state } of validatedCases) {
-        const reservation = await monitorStore.reserveProviderBudget({
-          provider: 'jev',
-          candidateId: `f5-live-evaluation:${item.id}`,
-          amountUsd: JEV_RESERVATION_USD,
-          ceilingUsd: config.budgetUsd.jev,
-        });
-        expect(reservation, `Insufficient Jev budget for held-out example ${item.id}`).toBeTruthy();
         const evaluated = await classifier.evaluate({
           state,
           abortSignal: AbortSignal.timeout(TIMING.jevCallMs),
@@ -228,25 +260,6 @@ describe('F5 live evaluation prerequisites', () => {
         });
         const evaluatedInputTokens = evaluated.usage.inputTokens;
         const evaluatedOutputTokens = evaluated.usage.outputTokens;
-        if (
-          typeof evaluatedInputTokens === 'number' &&
-          typeof evaluatedOutputTokens === 'number' &&
-          Number.isSafeInteger(evaluatedInputTokens) &&
-          Number.isSafeInteger(evaluatedOutputTokens) &&
-          evaluatedInputTokens >= 0 &&
-          evaluatedOutputTokens >= 0
-        ) {
-          await monitorStore.settleProviderReservation({
-            id: reservation!,
-            knownAmountUnits: Math.ceil(
-              ((evaluatedInputTokens * PRICING_REFERENCE.jevInputUsdPerMillion +
-                evaluatedOutputTokens * PRICING_REFERENCE.jevOutputUsdPerMillion) /
-                PRICING_REFERENCE.tokensPerPricingUnit) *
-                CLASSIFICATION_LIMITS.usdReservationUnits,
-            ),
-            unresolvedUnits: 0,
-          });
-        }
         if (typeof evaluated.response.modelId === 'string' && evaluated.response.modelId) {
           reportedModels.add(evaluated.response.modelId);
         } else missingReportedModel = true;
@@ -274,7 +287,7 @@ describe('F5 live evaluation prerequisites', () => {
           choiceConfidence: (evaluated.providerMetadata as any)?.typesafe?.confidence?.change_type,
         });
       }
-      const accounting = await monitorStore.providerBudgetAccounting('jev');
+      const accounting = await new TestSpendingLedger(monitorStore.client).providerBudgetAccounting('jev');
       const report = reportEvaluation({
         datasetVersion: LIVE_EVALUATION_DATASET_VERSION,
         questionSetVersion: QUESTION_SET_VERSION,
@@ -296,7 +309,7 @@ describe('F5 live evaluation prerequisites', () => {
           },
           budget: {
             provider: 'jev',
-            ceilingUsd: Math.min(PROJECT_BUDGET_USD.jev, config.budgetUsd.jev),
+            ceilingUsd: PROJECT_BUDGET_USD.jev,
             reservedUsd: accounting.reservedUsd,
             knownUsd: accounting.knownUsd,
             unresolvedUsd: accounting.unresolvedUsd,

@@ -1,132 +1,117 @@
-# Competitor monitor with Jev
+# Competitor Monitor with Jev
 
-This private Mastra template monitors configured public competitor pages. It stores immutable baselines, detects changed sections, uses Jev to classify changed evidence, and keeps the route, evidence, model provenance, and optional grounded summary in local storage for review.
+Tell the chat which product to monitor, share its public page URLs, and describe what matters to your team. The monitor compares pricing, changelog, and documentation pages with saved history. Jev classifies the changes, and OpenAI explains the results with source links and before and after excerpts.
 
-The template has not been published or accepted upstream. It is a local implementation intended for evaluation and contribution review.
+## Why we built this
 
-## Quickstart
+A page edit does not always mean a competitor changed its pricing or product. Navigation updates and promotional copy can distract from useful signals. This monitor keeps the evidence visible, uses Jev to assess each change, and applies a policy to ignore it, record it, request review, or flag an alert. First captures and unchanged pages need no Jev call.
 
-Use Node `^22.22.0 || >=24.12.0` and npm.
+## Prerequisites
 
-```bash
-npm install
-cp .env.example .env
-npm run dev
-```
+- **[OpenAI API key](https://platform.openai.com/api-keys)**: set `OPENAI_API_KEY` for the Studio chat. The chat uses `openai/gpt-6-luna` to understand requests and explain results. Your account needs access to this model.
+- **[TypeSafe AI API key](https://console.typesafe.ai)**: set `TYPESAFE_AI_API_KEY` to classify changes with Jev. Direct TypeSafe access is the default, using `jev-latest`.
+- **[Vercel AI Gateway key (alternative)](https://vercel.com/docs/ai-gateway/authentication-and-byok)**: instead of a TypeSafe key, set `JEV_ACCESS_MODE=vercel-gateway` and `AI_GATEWAY_API_KEY`. This route uses `typesafe-ai/jev`; your Gateway account needs access to it. OpenAI chat still uses `OPENAI_API_KEY` directly.
+- **[Google Chrome (optional)](https://www.google.com/chrome/)**: install Chrome for the local Stagehand fallback when a page needs browser rendering. Ordinary HTTP collection needs no browser account.
 
-Open `http://127.0.0.1:4111`. Local mode binds to loopback. Use that address instead of the CLI's `localhost` link so Studio and its API share an origin.
+## Quickstart 🚀
 
-Create a monitor input in Studio with public `pricing`, `changelog`, and `documentation` URLs. The first run creates authentic baselines. A later run fetches the same public URLs and reports the observed result: unchanged, changed, partial, deferred, or failed. The template cannot manufacture a third party change.
+1. **Open the template**
+   - Open the `template-competitor-monitor-jev` checkout and run `npm ci`.
+2. **Add your API keys**
+   - Run `cp .env.example .env` and fill in the values described under Prerequisites.
+   - Keep `EXECUTION_MODE=local`. Local databases are created automatically.
+3. **Start the dev server**
+   - Run `npm run dev`.
+   - Open [Mastra Studio](http://localhost:4111), select the **Competitor Monitor** agent (`competitor-monitor-agent`), and send the example below with a real company and its page URLs.
+   - The first successful check saves each page as a baseline. It does not report those pages as new changes. You enter the URLs in chat; no manual JSON setup is required.
 
-Use `EXECUTION_MODE=production` only with a nonblank `MASTRA_API_TOKEN`. Native SimpleAuth then protects Mastra routes. The token is static: rotate it by changing the environment value and restarting the process.
+## Try it out
+
+- **Monitor a product, like the [XYZ] company.** Send this message in Studio, with a real company and operational links for pricing, changelog, and documentation:
+
+  ```plaintext
+  Monitor [XYZ] for our product team.
+  Pricing: https://[XYZ].com/pricing
+  Changelog: https://[XYZ].com/changelog
+  Documentation: https://[XYZ].com/docs
+  Focus on pricing, plan changes, new features, and deprecations.
+  Check these pages now and explain the result.
+  ```
+
+- **Check again later.** In the same conversation, send “Check the same [XYZ] pages again.” The monitor compares current content with saved captures. Unchanged pages skip Jev; actual changes include their evidence and routing decision. Each request runs one check.
+- **Explain a change.** Ask “Which changes need review, and what changed before and after?” The chat explains the returned evidence and identifies uncertainty or incomplete work.
+- **Monitor your own product list.** Send another product name, its public URLs, and your interests. The chat asks for missing information and creates a separate monitor. Reuse the same monitor and source identities for later comparisons; give replacement URLs new source IDs.
+
+Each monitor accepts **3 sites by default**. Set `MAX_SOURCES` to another value from 1 to 20 to change this limit. `SOURCE_CONCURRENCY=3` separately controls how many sites are fetched at once (maximum 5). Use a separate `monitorId` for each competitor so their histories remain independent.
+
+## Customization
+
+- Ask your coding agent: “Explore the acquisition, Jev questions, and routing policy. Propose a plan to prioritize pricing and deprecation changes while preserving exact evidence and uncertainty review.”
+- Adjust the interests, priorities, or ignored signals you give the chat. The accepted `interests` values and other workflow input fields are defined in [`src/mastra/schemas.ts`](src/mastra/schemas.ts). For collection rules, use `contentSelector` and `ignoreSelectors` in workflow inputs. Operational defaults live in `src/mastra/config/`.
 
 ## How the monitor uses Mastra and Jev
 
-Mastra owns the typed workflow, native Classifier registration, durable framework storage, schedules, observability, and the optional report agent. The monitor's classifier is registered once with the six Jev questions: Choice for change type, Score for relevance and business impact, and Boolean judgments for substantive, breaking, and cosmetic changes.
+The OpenAI agent converts your request into input for the native `competitorMonitor` workflow. Chat and structured runs share the same collection, storage, and classification logic. Chat runs explain the report directly, avoiding a separate summary-generation call.
 
-The workflow retrieves that registered classifier and calls its native audit boundary directly:
+The native Jev Classifier asks six questions: change type, relevance, business impact, and whether the change is substantive, breaking, or cosmetic. The change-type choices and routing decisions are defined in [`src/mastra/lib/classification.ts`](src/mastra/lib/classification.ts). Code combines these answers with the routing policy. Low confidence or conflicting answers go to review. Jev evaluates evidence; OpenAI provides conversation and explanations.
 
-```ts
-const result = await classifier.evaluate({
-  state,
-  abortSignal: classificationAbortSignal(abortSignal),
-  maxRetries: TIMING.maxRetries,
-});
-```
-
-The routing policy retains fractional scores, Choice confidence, warnings, rounding, requested and reported model identities. Low confidence, conflicting signals, mixed evidence, and unknown categories route to review. Missing usage or unverified model identity remains unknown; it is never treated as free or verified.
-
-No model call is made for a new baseline or unchanged source. A changed candidate reserves the conservative Jev budget before native evaluation. Optional OpenAI summaries receive only bounded stored evidence and never replace a classification decision.
+Reports retain exact excerpts, source URLs, question-set and routing-rule versions, and available model identities. Missing provider information stays unknown.
 
 ## Configuration and data
 
-Copy `.env.example` and keep credentials outside version control. `MASTRA_DATABASE_URL` stores Mastra state; `MONITOR_DATABASE_URL` stores immutable snapshots, pending evidence, decisions, and provider reservations. Relative `file:` URLs resolve from the project root, outside the disposable `.mastra` build directory.
+- **Structured runs:** the **competitorMonitor** workflow (`competitor-monitor`) remains available in Studio for integrations or direct input. Its JSON input accepts `monitorId`, `profile`, and `sources`; the chat builds this input for you. Without OpenAI, you can use this workflow directly, but chat and generated summaries are unavailable.
+- **Storage:** `.data/mastra.db` holds Mastra state; `.data/competitor-monitor.db` holds snapshots, pending changes, and decisions. Override these paths with `MASTRA_DATABASE_URL` and `MONITOR_DATABASE_URL`. Preserve both databases across restarts. Page history is durable; the agent uses the conversation supplied with each request, so repeat the product, URLs, and interests when starting a new conversation.
+- **Recurring checks:** the scheduler is disabled by default. Add real monitor inputs to the ignored `scheduled-monitors.json` file and set `ENABLE_MONITOR_SCHEDULER=true` as described below. Mastra then registers one schedule per monitor on startup. A long-lived Mastra process must stay running for daily checks.
+- **Production mode:** set `EXECUTION_MODE=production` and a nonblank `MASTRA_API_TOKEN` for native SimpleAuth protection. The static token has no expiry; rotate it by changing the value and restarting. Local mode binds to `127.0.0.1`.
 
-Jev defaults to direct TypeSafe access with `TYPESAFE_AI_API_KEY`, `JEV_MODEL=jev-latest`, and `JEV_COST_ATTESTATION=typesafe-jev-2026-09-27:jev-latest`. The optional `JEV_ACCESS_MODE=vercel-gateway` route uses only `AI_GATEWAY_API_KEY`, fixed `https://ai-gateway.vercel.sh/typesafe/v1`, model `typesafe-ai/jev`, and `JEV_COST_ATTESTATION=vercel-ai-gateway-typesafe-2026-09-29:typesafe-ai/jev`. The application never accepts a configurable Gateway destination. OpenAI summaries require `OPENAI_API_KEY` and a matching `OPENAI_COST_ATTESTATION`. Attestations mean the operator has verified account model access and tariff. `JEV_BUDGET_USD` and `OPENAI_BUDGET_USD` can only lower their separate project ceilings.
+### Accepted values
 
-The weekly native schedule is opt-in and needs a long lived process. It is never created during installation or startup.
+The workflow input contract is in [`src/mastra/schemas.ts`](src/mastra/schemas.ts). Its enumerated fields are:
 
-## Evaluation and live demonstration
+| Field                 | Accepted values                                                                                                                                                          |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `profile.interests`   | `pricing`, `packaging`, `product_feature`, `availability`, `deprecation`, `policy_terms`, `security_compliance`, `documentation`, `company_announcement` (choose 1 to 9) |
+| `sources[].kind`      | `pricing`, `changelog`, `documentation`, `blog`, `status`, `other`                                                                                                       |
+| `sources[].fetchMode` | `auto` (default), `http`, `browser`                                                                                                                                      |
+| `runMode`             | `baseline`, `manual` (default), `scheduled` (set automatically for configured schedules)                                                                                 |
 
-`npm run test:evaluation` runs the versioned F5 synthetic dataset through an official `@mastra/evals/vitest` workflow assertion. The fixtures cover unchanged, navigation, promotion, pricing, packaging, feature, deprecation, security, documentation, acquisition failure, prompt injection, and unsupported language. Calibration and held-out examples have separate IDs. The report exposes model-question-rule versions, sample denominators, route accuracy, alert precision/recall, review recall, evidence attribution, and summary support. A zero denominator is reported as undefined.
+The environment choices for `EXECUTION_MODE`, `JEV_ACCESS_MODE`, and `ENABLE_MONITOR_SCHEDULER` are defined in [`src/mastra/config/index.ts`](src/mastra/config/index.ts). The report routes `alert`, `review`, `record`, and `ignore` are defined in [`src/mastra/lib/classification.ts`](src/mastra/lib/classification.ts) and validated in [`src/mastra/lib/reporting.ts`](src/mastra/lib/reporting.ts).
 
-Synthetic fixtures are test-only. They are never a demo substitute.
+The meanings of every `profile.interests` value, plus descriptions of the other workflow fields, are documented beside their definitions in [`src/mastra/schemas.ts`](src/mastra/schemas.ts). For example, `packaging` concerns plan contents, limits, and entitlements; `security_compliance` concerns security controls, certifications, and compliance commitments. The workflow passes the selected interests **with these definitions**, your `organizationContext`, and any `prioritySignals` or `ignoredSignals` to Jev with each before/after excerpt. Jev uses the [change-type and relevance criteria](src/mastra/lib/classification.ts) to judge the evidence. These profile fields guide its assessment; they do not exclude evidence or force an alert. To customize what an interest means, edit `INTEREST_DEFINITIONS` in the schema and the corresponding classifier criteria.
 
-`npm run test:live-evaluation` is a bounded live selector. It fails when any prerequisite is absent; it does not skip or simulate the result. Before running it, export the credentials and attestation from `.env` and provide `F5_LIVE_INPUT_JSON` with one real public pricing, changelog, and documentation source. A first run creates authentic baselines; a prior baseline is verified against the same URL when it exists. The selector runs the existing workflow and storage budget controls. It may honestly report unchanged pages, site errors, budget deferral, or classified changes; it does not guarantee an alert or a model call.
+`runMode: "baseline"` is for an initial capture: it creates snapshots for sources that have no baseline, leaves existing baselines untouched, and defers pending classification. `runMode: "manual"` also creates missing baselines on the first check, but later checks compare pages and classify changes; it does not send notifications. `runMode: "scheduled"` compares and classifies like `manual` and invokes enabled notification providers when it detects new changes. The default is `manual`.
 
-In Studio, switch to **JSON** input before submitting this payload. The generated form currently serializes numeric policy defaults as strings and sends empty optional numeric fields, which fails schema validation. The JSON payload uses numeric policy values and a lower supported content floor for these public pages.
+### Daily schedule
 
-```bash
-set -a
-source .env
-set +a
-export F5_LIVE_INPUT_JSON='{"monitorId":"f5-smoke-20260929","runMode":"manual","profile":{"name":"Operator","interests":["pricing","documentation"],"prioritySignals":[],"ignoredSignals":[]},"sources":[{"id":"cloudflare-pricing","label":"Cloudflare plans","url":"https://www.cloudflare.com/plans/","kind":"pricing","minContentChars":100,"ignoreSelectors":[]},{"id":"cloudflare-changelog","label":"Cloudflare changelog","url":"https://developers.cloudflare.com/changelog/","kind":"changelog","minContentChars":100,"ignoreSelectors":[]},{"id":"cloudflare-docs","label":"Cloudflare Workers documentation","url":"https://developers.cloudflare.com/workers/","kind":"documentation","minContentChars":100,"ignoreSelectors":[]}],"policy":{"minimumSubstantiveProbability":0.7,"minimumBreakingProbability":0.65,"minimumChoiceConfidence":0.6,"minimumScoreConfidence":0.6,"alertFromRelevanceLevel":2,"alertFromImpactLevel":2,"maxCandidatesPerSource":3,"sourceConcurrency":3},"options":{"generateSummary":false,"includeUnchangedSources":true}}'
-npm run test:live-evaluation
+The project includes an ignored `scheduled-monitors.json` configuration file, initially containing `[]`, and a versioned [`scheduled-monitors-example.json`](scheduled-monitors-example.json) showing two competitors. To configure daily monitoring:
+
+1. Copy `scheduled-monitors-example.json` to `scheduled-monitors.json`, or edit the existing file. Replace every `.example` URL with a real public page. Keep one JSON array entry per competitor, with a unique `monitorId` and up to 3 `sources` by default.
+2. Set this value in `.env`:
+
+```dotenv
+ENABLE_MONITOR_SCHEDULER=true
 ```
 
-The live selector does not store a synthetic baseline, use mocked acquisition, or inject classifier answers. This documented demo constrains `generateSummary` to `false`; a real summary requires a separately configured OpenAI account and attestation. It permits a first run to create real baselines and records failed sources as failures. `F5_LIVE_EVALUATION_CASES_JSON` is a JSON array of labeled held-out cases with `id`, `split`, `expectedRoute`, `evidence`, `classificationState`, and `provenance.reviewedAt`. Cases are explicitly either synthetic held-out or operator-supplied experiments and are never live-site provenance. Check provider availability, account billing, and remaining project budget before it is run.
+`ENABLE_MONITOR_SCHEDULER=false` is the default, so merely creating the JSON file does not start monitoring. When enabled, startup requires a nonempty, valid `scheduled-monitors.json`; it fails clearly if the file is missing or invalid. The registered workflow checks each configured competitor **daily at 09:00 UTC** (`0 9 * * *`). This is a fixed daily time, not a timer that starts 24 hours after the previous run. The first successful check saves a baseline; later checks compare against it. To change the time or timezone, edit `SCHEDULE_DEFAULTS` in `src/mastra/config/model-defaults-config.ts`. The developer can also replace the native scheduler or register schedules programmatically with `ensureDailyMonitorSchedule` in `src/mastra/lib/schedules.ts`. Restart the Mastra process after changing the JSON file or `.env`. View or pause schedules in Mastra Studio's Schedules area.
 
-Each held-out case retains the bounded state that is sent to Jev and the matching evidence used for routing. The approved three-case synthetic subset is in `tests/fixtures/f5-live-held-out-cases.json`; label it `synthetic-held-out-live-jev-experiment` and never present it as a public-site demo. Replace the example values with a reviewed capture and `operator-supplied-live-jev-experiment` only when its provenance is independently retained.
+### Notification output
 
-```bash
-export F5_LIVE_EVALUATION_CASES_JSON="$(cat tests/fixtures/f5-live-held-out-cases.json)"
-```
+The final `notify-competitor-changes` step invokes every enabled `NotificationProvider` **only when a scheduled run has detected changes**. The example provider writes one dated Markdown report per run to `.data/reports/`, including each change's source URL and available before/after excerpts. Keep this directory on persistent storage if you need reports across deployments. Baselines, unchanged runs, and manual chat checks do not create reports. If a provider fails, the other providers are still attempted and the run records `notificationFailures` in its output.
 
-```json
-[
-  {
-    "id": "reviewed-held-out-001",
-    "split": "held-out",
-    "expectedRoute": "alert",
-    "evidence": {
-      "id": "reviewed-held-out-001",
-      "sectionKey": "pricing",
-      "beforeText": "Pro costs $29.",
-      "afterText": "Pro costs $39.",
-      "beforeExcerpt": "Pro costs $29.",
-      "afterExcerpt": "Pro costs $39.",
-      "excerptTruncated": false,
-      "kind": "modified"
-    },
-    "classificationState": {
-      "evidence": {
-        "id": "reviewed-held-out-001",
-        "sectionKey": "pricing",
-        "beforeText": "Pro costs $29.",
-        "afterText": "Pro costs $39.",
-        "beforeExcerpt": "Pro costs $29.",
-        "afterExcerpt": "Pro costs $39.",
-        "excerptTruncated": false,
-        "kind": "modified"
-      },
-      "source": { "id": "pricing", "label": "Pricing", "url": "https://example.com/pricing", "kind": "pricing" },
-      "interests": ["pricing"],
-      "prioritySignals": [],
-      "ignoredSignals": []
-    },
-    "provenance": { "kind": "operator-supplied-live-jev-experiment", "reviewedAt": "2026-09-29T20:16:01Z" }
-  }
-]
-```
+Enable, remove, or add provider instances in `src/mastra/notifications/index.ts`. Implement the small `NotificationProvider` contract in `src/mastra/notifications/types.ts` for the delivery you want: an API call, email, or a [Mastra Channel](https://mastra.ai/docs/channels). Channels connect an agent to a chat platform; sending a scheduled report to a chosen destination still needs provider code that posts that report. The Markdown writer is an example local notification, not an external message.
 
-The `npm_quickstart_runs_demo_workflow` selector remains blocked until an operator runs `npm run dev`, submits the documented input through Studio, and retains the native workflow run ID. Set `F5_MANUAL_STUDIO_SMOKE_RECORD_JSON` to JSON containing `nativeWorkflowRunId`, `monitorId`, `sourceId`, `sourceUrl`, and `observedAt`. The selector verifies that record against the durable monitor run and baseline for the same configured URL; a configuration preflight is not treated as the proof. Independent review still checks the operator's Studio evidence.
+## Evaluation
 
-## Checks
+Run `npm run test:evaluation` for the versioned synthetic dataset and native Mastra workflow assertions. Calibration and held-out examples are separate, and metrics include their denominators. See [CONTRIBUTING.md](CONTRIBUTING.md) for implementation checks.
 
-```bash
-npm run format:check
-npm run typecheck
-npm run build
-npm run test:unit
-npm run test:classification
-npm run test:integration
-npm run test:browser
-npm run test:reports
-npm run test:evaluation
-```
+## Limitations
 
-## Customization and limitations
+The monitor collects public English-language pages that allow automated access, without login or CAPTCHA.
 
-Adjust source lists, profile interests, and policy thresholds in a monitor input. Operational ceilings and validated environment overrides live in `src/mastra/config/`; keep changes there so budget, timeout, and concurrency behavior remain explicit.
+The English-only restriction is due to Jev's current language performance: English is its primary training language and where its accuracy is currently best. Jev can process other languages, but they do not perform equally well, so this template limits monitored pages to English for more reliable change classification. See TypeSafe AI's [Jev language support documentation](https://docs.typesafe.ai/models#language-support).
 
-The monitor only acquires public HTTP(S) pages. It does not log in, bypass CAPTCHA, submit forms, discover URLs autonomously, send alerts to external systems, or create hosted infrastructure. Browser fallback and summary generation remain bounded optional capabilities. Live results are measurements of the supplied URLs and account configuration, not a performance, cost, speed, or accuracy guarantee.
+## About Mastra templates
+
+This independently maintained template combines native Mastra agents, workflows, and Classifier evaluation with TypeSafe AI's Jev. It is being prepared for contribution to Mastra and is not yet available in the template catalog.
+
+[Want to contribute?](CONTRIBUTING.md)

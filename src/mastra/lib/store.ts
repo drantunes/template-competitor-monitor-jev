@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 import { createClient, type Client } from '@libsql/client';
 
-import { CLASSIFICATION_LIMITS, resolveDatabaseUrl } from '../config';
+import { resolveDatabaseUrl } from '../config';
 import type { ClassificationDecision } from './classification';
 import type { Evidence, NormalizedContent } from './content';
 
@@ -157,16 +157,6 @@ export class MonitorStore {
         audit_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
         PRIMARY KEY (candidate_id, question_set_version, rule_version)
-      );
-      CREATE TABLE IF NOT EXISTS provider_reservations (
-        id TEXT PRIMARY KEY,
-        provider TEXT NOT NULL,
-        candidate_id TEXT NOT NULL,
-        amount_units INTEGER NOT NULL,
-        known_amount_units INTEGER,
-        unresolved_units INTEGER NOT NULL,
-        status TEXT NOT NULL,
-        created_at TEXT NOT NULL
       );
     `);
     // Older F1 databases store only normalized content. Keep those immutable rows readable and add
@@ -465,6 +455,16 @@ export class MonitorStore {
     return result.rows.map(row => JSON.parse(String(row.evidence_json)) as Evidence);
   }
 
+  /** Candidate identities first detected by this run, including candidates classified later. */
+  async candidateIdsForRun(runId: string) {
+    await this.init();
+    const result = await this.client.execute({
+      sql: 'SELECT id FROM pending_evidence WHERE run_id = ?',
+      args: [runId],
+    });
+    return result.rows.map(row => String(row.id));
+  }
+
   async evidence(candidateId: string) {
     const result = await this.client.execute({
       sql: `SELECT p.evidence_json, s.source_url FROM pending_evidence p
@@ -502,96 +502,13 @@ export class MonitorStore {
     }));
   }
 
-  /** Atomically reserves the full bounded native-call allowance. Reservations remain on uncertain billing. */
-  async reserveProviderBudget(input: {
-    provider: 'jev' | 'openai';
-    candidateId: string;
-    amountUsd: number;
-    ceilingUsd: number;
-  }) {
-    await this.init();
-    const id = randomUUID();
-    const amountUnits = Math.ceil(input.amountUsd * CLASSIFICATION_LIMITS.usdReservationUnits);
-    const ceilingUnits = Math.floor(input.ceilingUsd * CLASSIFICATION_LIMITS.usdReservationUnits);
-    const result = await this.client.execute({
-      sql: `INSERT INTO provider_reservations (id, provider, candidate_id, amount_units, unresolved_units, status, created_at)
-            SELECT ?, ?, ?, ?, ?, 'uncertain', ?
-            WHERE COALESCE((SELECT SUM(COALESCE(known_amount_units + unresolved_units, amount_units)) FROM provider_reservations WHERE provider = ?), 0) + ? <= ?`,
-      args: [
-        id,
-        input.provider,
-        input.candidateId,
-        amountUnits,
-        amountUnits,
-        new Date().toISOString(),
-        input.provider,
-        amountUnits,
-        ceilingUnits,
-      ],
-    });
-    return result.rowsAffected > 0 ? id : undefined;
-  }
-
-  /** Release only a reservation made before an evaluation was dispatched. Attempted calls remain uncertain. */
-  async releaseUnattemptedProviderReservation(id: string) {
-    await this.client.execute({
-      sql: `DELETE FROM provider_reservations
-            WHERE id = ? AND status = 'uncertain' AND known_amount_units IS NULL AND unresolved_units = amount_units`,
-      args: [id],
-    });
-  }
-
-  /** Record completed provider usage only when all billed components are known within the original reservation. */
-  async settleProviderReservation(input: { id: string; knownAmountUnits: number; unresolvedUnits: number }) {
-    await this.init();
-    if (
-      !Number.isSafeInteger(input.knownAmountUnits) ||
-      !Number.isSafeInteger(input.unresolvedUnits) ||
-      input.knownAmountUnits < 0 ||
-      input.unresolvedUnits < 0
-    ) {
-      throw new Error('INVALID_PROVIDER_RESERVATION_SETTLEMENT');
-    }
-    const result = await this.client.execute({
-      sql: `UPDATE provider_reservations
-            SET known_amount_units = ?, unresolved_units = ?, status = CASE WHEN ? = 0 THEN 'settled' ELSE 'uncertain' END
-            WHERE id = ? AND status = 'uncertain' AND known_amount_units IS NULL AND unresolved_units = amount_units
-              AND ? + ? <= amount_units`,
-      args: [
-        input.knownAmountUnits,
-        input.unresolvedUnits,
-        input.unresolvedUnits,
-        input.id,
-        input.knownAmountUnits,
-        input.unresolvedUnits,
-      ],
-    });
-    return result.rowsAffected > 0;
-  }
-
   async commitClassification(input: {
     candidateId: string;
     questionSetVersion: string;
     decision: ClassificationDecision;
     audit: Record<string, unknown>;
-    reservationId?: string;
-    knownUsageUsd?: number;
-    unresolvedUsageUsd?: number;
   }) {
     await this.init();
-    const settlement =
-      input.reservationId && input.knownUsageUsd !== undefined && input.unresolvedUsageUsd !== undefined
-        ? [
-            {
-              sql: 'UPDATE provider_reservations SET known_amount_units = ?, unresolved_units = ? WHERE id = ?',
-              args: [
-                Math.ceil(input.knownUsageUsd * CLASSIFICATION_LIMITS.usdReservationUnits),
-                Math.ceil(input.unresolvedUsageUsd * CLASSIFICATION_LIMITS.usdReservationUnits),
-                input.reservationId,
-              ],
-            },
-          ]
-        : [];
     await this.client.batch(
       [
         {
@@ -608,7 +525,6 @@ export class MonitorStore {
           ],
         },
         { sql: "UPDATE pending_evidence SET status = 'classified' WHERE id = ?", args: [input.candidateId] },
-        ...settlement,
       ],
       'write',
     );
@@ -629,26 +545,6 @@ export class MonitorStore {
           audit: JSON.parse(String(row.audit_json)) as Record<string, unknown>,
         } satisfies StoredClassification)
       : undefined;
-  }
-
-  async reservedProviderUsd(provider: 'jev' | 'openai') {
-    const result = await this.client.execute({
-      sql: 'SELECT COALESCE(SUM(COALESCE(known_amount_units + unresolved_units, amount_units)), 0) AS amount FROM provider_reservations WHERE provider = ?',
-      args: [provider],
-    });
-    return Number(result.rows[0]?.amount ?? 0) / CLASSIFICATION_LIMITS.usdReservationUnits;
-  }
-
-  /** Durable provider totals distinguish reconciled spend from attempts whose billing remains unknown. */
-  async providerBudgetAccounting(provider: 'jev' | 'openai') {
-    const result = await this.client.execute({
-      sql: `SELECT COALESCE(SUM(known_amount_units), 0) AS known, COALESCE(SUM(unresolved_units), 0) AS unresolved
-            FROM provider_reservations WHERE provider = ?`,
-      args: [provider],
-    });
-    const knownUsd = Number(result.rows[0]?.known ?? 0) / CLASSIFICATION_LIMITS.usdReservationUnits;
-    const unresolvedUsd = Number(result.rows[0]?.unresolved ?? 0) / CLASSIFICATION_LIMITS.usdReservationUnits;
-    return { knownUsd, unresolvedUsd, reservedUsd: knownUsd + unresolvedUsd };
   }
 
   async pendingWarningsForSource(monitorId: string, sourceId: string): Promise<string[]> {

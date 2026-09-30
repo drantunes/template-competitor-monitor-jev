@@ -3,15 +3,7 @@ import { ConsoleLogger } from '@mastra/core/logger';
 import { Mastra } from '@mastra/core/mastra';
 import { z } from 'zod';
 
-import {
-  CLASSIFICATION_LIMITS,
-  MODEL_DEFAULTS,
-  PRICING_REFERENCE,
-  SUMMARY_LIMITS,
-  SUMMARY_RESERVATION_USD,
-  TIMING,
-  type MonitorConfig,
-} from '../config';
+import { MODEL_DEFAULTS, SUMMARY_LIMITS, TIMING, type MonitorConfig } from '../config';
 import type { MonitorStore } from './store';
 
 export const REPORT_SUMMARY_AGENT_ID = 'competitor-report-summary';
@@ -52,11 +44,9 @@ export type Report = {
     | 'SUMMARY_DISABLED'
     | 'SUMMARY_NOT_APPLICABLE'
     | 'SUMMARY_EVIDENCE_TOO_LARGE'
-    | 'COST_UNVERIFIED'
-    | 'BUDGET_EXHAUSTED'
+    | 'SUMMARY_NOT_CONFIGURED'
     | 'SUMMARY_FAILED'
-    | 'SUMMARY_INVALID'
-    | 'SUMMARY_USAGE_UNRECONCILED';
+    | 'SUMMARY_INVALID';
   changes: ReportChange[];
 };
 
@@ -82,11 +72,9 @@ export const reportSchema = z.object({
       'SUMMARY_DISABLED',
       'SUMMARY_NOT_APPLICABLE',
       'SUMMARY_EVIDENCE_TOO_LARGE',
-      'COST_UNVERIFIED',
-      'BUDGET_EXHAUSTED',
+      'SUMMARY_NOT_CONFIGURED',
       'SUMMARY_FAILED',
       'SUMMARY_INVALID',
-      'SUMMARY_USAGE_UNRECONCILED',
     ])
     .optional(),
 });
@@ -147,25 +135,6 @@ function validSummary(summary: ReportSummary, changes: ReportChange[], suppliedI
   return summary.quotedEvidence.every(quote => quotes.has(quote));
 }
 
-function isTokenCount(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
-}
-
-/** `totalUsage` fills absent fields with zero, so only explicit completed input and output counts are billable evidence. */
-function summaryUsageUnits(usage: unknown) {
-  if (!usage || typeof usage !== 'object') return undefined;
-  const { inputTokens, outputTokens } = usage as Record<string, unknown>;
-  if (!isTokenCount(inputTokens) || !isTokenCount(outputTokens)) {
-    return undefined;
-  }
-  return Math.ceil(
-    ((inputTokens * PRICING_REFERENCE.openaiInputUsdPerMillion +
-      outputTokens * PRICING_REFERENCE.openaiOutputUsdPerMillion) /
-      PRICING_REFERENCE.tokensPerPricingUnit) *
-      CLASSIFICATION_LIMITS.usdReservationUnits,
-  );
-}
-
 async function reportChanges(store: MonitorStore, changes: ReportChange[]) {
   return Promise.all(
     changes.map(async change => {
@@ -210,7 +179,6 @@ function modelIdentity(audit: Record<string, unknown>, field: 'requestedModel' |
 
 /** Assemble code-owned URLs/excerpts first; a summary can only add validated prose for alert or review. */
 export async function buildReport(input: {
-  runId: string;
   changes: ReportChange[];
   generateSummary: boolean;
   config: MonitorConfig;
@@ -228,16 +196,9 @@ export async function buildReport(input: {
       summaryFailure: summaryRequest.oversizedCandidate ? 'SUMMARY_EVIDENCE_TOO_LARGE' : 'SUMMARY_NOT_APPLICABLE',
     } satisfies Report;
   }
-  if (!input.config.credentials.openaiApiKey || !input.config.billing.openaiCostAttested || !input.agent) {
-    return { changes, summaryFailure: 'COST_UNVERIFIED' } satisfies Report;
+  if (!input.config.credentials.openaiApiKey || !input.agent) {
+    return { changes, summaryFailure: 'SUMMARY_NOT_CONFIGURED' } satisfies Report;
   }
-  const reservation = await input.store.reserveProviderBudget({
-    provider: 'openai',
-    candidateId: `summary:${input.runId}`,
-    amountUsd: SUMMARY_RESERVATION_USD,
-    ceilingUsd: input.config.budgetUsd.openai,
-  });
-  if (!reservation) return { changes, summaryFailure: 'BUDGET_EXHAUSTED' } satisfies Report;
   try {
     const generated = await input.agent.generate(summaryRequest.prompt, {
       abortSignal: AbortSignal.timeout(TIMING.summaryCallMs),
@@ -245,28 +206,11 @@ export async function buildReport(input: {
       providerOptions: { openai: { reasoningEffort: MODEL_DEFAULTS.summaryReasoning } },
       structuredOutput: { schema: summarySchema },
     });
-    const knownAmountUnits = summaryUsageUnits(generated.usage);
-    if (knownAmountUnits !== undefined) {
-      const settled = await input.store.settleProviderReservation({
-        id: reservation,
-        knownAmountUnits,
-        unresolvedUnits: 0,
-      });
-      if (!settled) return { changes, summaryFailure: 'SUMMARY_USAGE_UNRECONCILED' } satisfies Report;
-    }
     const summary = summarySchema.parse(generated.object);
     if (!validSummary(summary, eligible, summaryRequest.selectedIds))
       return { changes, summaryFailure: 'SUMMARY_INVALID' } satisfies Report;
     return { changes, summary } satisfies Report;
   } catch {
-    // A dispatched call has an uncertain bill; the reservation is intentionally retained.
     return { changes, summaryFailure: 'SUMMARY_FAILED' } satisfies Report;
   }
 }
-
-// Export the tariff inputs used by the summary reservation for focused offline contract tests.
-export const SUMMARY_TARIFF = {
-  model: MODEL_DEFAULTS.summary,
-  inputUsdPerMillion: PRICING_REFERENCE.openaiInputUsdPerMillion,
-  outputUsdPerMillion: PRICING_REFERENCE.openaiOutputUsdPerMillion,
-} as const;

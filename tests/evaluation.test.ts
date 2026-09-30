@@ -1,3 +1,5 @@
+import { TestSpendingLedger } from './provider-spending-ledger';
+import { PROJECT_BUDGET_USD } from './provider-spending-config';
 import { createScorer } from '@mastra/core/evals';
 import { Classifier } from '@mastra/core/classifier';
 import { Mastra } from '@mastra/core/mastra';
@@ -87,7 +89,7 @@ describe('F5 evaluation dataset and reporting', () => {
         budget: { provider: 'jev', knownUsd: 0.002 },
       },
     });
-    expect(workflowProof.report.provenance.budget?.unresolvedUsd).toBeGreaterThan(0.01);
+    expect(workflowProof.report.provenance.budget?.unresolvedUsd).toBe(0.01);
   });
 });
 
@@ -97,7 +99,6 @@ async function runWorkflowProof(): Promise<WorkflowProof> {
     MONITOR_DATABASE_URL: `file:${join(directory, 'monitor.db')}`,
     MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
     TYPESAFE_AI_API_KEY: 'synthetic-key',
-    JEV_COST_ATTESTATION: 'typesafe-jev-2026-09-27:jev-latest',
   });
   const store = MonitorStore.open(config.storage.monitorUrl);
   let useAfterSnapshots = false;
@@ -294,24 +295,25 @@ async function runWorkflowProof(): Promise<WorkflowProof> {
           evidence.beforeText === fixture!.evidence!.beforeText && evidence.afterText === fixture!.evidence!.afterText,
       };
     });
-    const knownReservation = await store.reserveProviderBudget({
+    const spending = new TestSpendingLedger(store.client);
+    const knownReservation = await spending.reserveProviderBudget({
       provider: 'jev',
       candidateId: 'f5-report-known',
       amountUsd: 0.01,
-      ceilingUsd: config.budgetUsd.jev,
+      ceilingUsd: PROJECT_BUDGET_USD.jev,
     });
     expect(knownReservation).toBeTruthy();
     expect(
-      await store.settleProviderReservation({ id: knownReservation!, knownAmountUnits: 2_000, unresolvedUnits: 0 }),
+      await spending.settleProviderReservation({ id: knownReservation!, knownAmountUnits: 2_000, unresolvedUnits: 0 }),
     ).toBe(true);
-    const unresolvedReservation = await store.reserveProviderBudget({
+    const unresolvedReservation = await spending.reserveProviderBudget({
       provider: 'jev',
       candidateId: 'f5-report-unresolved',
       amountUsd: 0.01,
-      ceilingUsd: config.budgetUsd.jev,
+      ceilingUsd: PROJECT_BUDGET_USD.jev,
     });
     expect(unresolvedReservation).toBeTruthy();
-    const accounting = await store.providerBudgetAccounting('jev');
+    const accounting = await spending.providerBudgetAccounting('jev');
     const report = reportEvaluation({
       datasetVersion: EVALUATION_DATASET_VERSION,
       questionSetVersion: QUESTION_SET_VERSION,
@@ -319,7 +321,7 @@ async function runWorkflowProof(): Promise<WorkflowProof> {
       observations: [...observations, ...nonroutableObservations],
       provenance: {
         model: { requested: 'fixture' },
-        budget: { provider: 'jev', ceilingUsd: config.budgetUsd.jev, ...accounting },
+        budget: { provider: 'jev', ceilingUsd: PROJECT_BUDGET_USD.jev, ...accounting },
       },
     });
     expect(report).toMatchObject({
@@ -335,10 +337,10 @@ async function runWorkflowProof(): Promise<WorkflowProof> {
       provenance: {
         model: { requested: 'fixture', reported: null, verified: null },
         usage: { inputTokens: null, outputTokens: null },
-        budget: { provider: 'jev', ceilingUsd: config.budgetUsd.jev, knownUsd: 0.002 },
+        budget: { provider: 'jev', ceilingUsd: PROJECT_BUDGET_USD.jev, knownUsd: 0.002 },
       },
     });
-    expect(report.provenance.budget?.unresolvedUsd).toBeGreaterThan(0.01);
+    expect(report.provenance.budget?.unresolvedUsd).toBe(0.01);
     expect(report.provenance.budget?.reservedUsd).toBe(
       (report.provenance.budget?.knownUsd ?? 0) + (report.provenance.budget?.unresolvedUsd ?? 0),
     );

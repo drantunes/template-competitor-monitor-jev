@@ -111,6 +111,7 @@ describe('bounded browser fallback', () => {
     const config = loadConfig({
       MONITOR_DATABASE_URL: `file:${directory}/monitor.db`,
       MASTRA_DATABASE_URL: `file:${directory}/mastra.db`,
+      MAX_SOURCES: '4',
     });
     const store = MonitorStore.open(config.storage.monitorUrl);
     stores.push(store);

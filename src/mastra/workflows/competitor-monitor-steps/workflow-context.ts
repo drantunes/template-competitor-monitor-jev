@@ -4,6 +4,7 @@ import type { MonitorConfig } from '../../config';
 import type { DnsResolver, PinnedTransport } from '../../lib/acquisition';
 import { reportChangeSchema, reportSchema, type SummaryAgent } from '../../lib/reporting';
 import { MonitorStore } from '../../lib/store';
+import type { NotificationProvider } from '../../notifications';
 import { monitorInputSchema, sourceSchema, type MonitorInput } from '../../schemas';
 
 export type MonitorRunResult = {
@@ -28,6 +29,7 @@ export type MonitorRunResult = {
   }>;
   changes: z.infer<typeof reportChangeSchema>[];
   report: z.infer<typeof reportSchema>;
+  notificationFailures?: string[];
 };
 
 export type Dependencies = {
@@ -36,6 +38,7 @@ export type Dependencies = {
   resolver?: DnsResolver;
   transport?: PinnedTransport;
   summaryAgent?: SummaryAgent;
+  notificationProviders?: readonly NotificationProvider[];
 };
 
 export class RunConcurrencyLimiter {
@@ -85,6 +88,7 @@ export const workflowOutputSchema = z.object({
   ),
   changes: z.array(reportChangeSchema),
   report: reportSchema,
+  notificationFailures: z.array(z.string()).optional(),
 });
 
 export const sourceTaskSchema = z.object({ runId: z.string(), input: monitorInputSchema, source: sourceSchema });

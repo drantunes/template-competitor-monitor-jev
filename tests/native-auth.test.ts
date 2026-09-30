@@ -35,6 +35,29 @@ async function productionApp(token: string) {
 }
 
 describe('native Mastra SimpleAuth', () => {
+  it('registers OpenAI chat without provider calls during initialization', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'competitor-monitor-chat-init-'));
+    vi.stubEnv('EXECUTION_MODE', 'local');
+    vi.stubEnv('OPENAI_API_KEY', 'synthetic-chat-key');
+    vi.stubEnv('MASTRA_DATABASE_URL', `file:${join(directory, 'mastra.db')}`);
+    vi.stubEnv('MONITOR_DATABASE_URL', `file:${join(directory, 'monitor.db')}`);
+    const fetch = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('UNEXPECTED_PROVIDER_CALL'));
+    const { mastra } = await import('../src/mastra/index');
+    const { bootstrap, initializeRuntime } = await import('../src/mastra/bootstrap');
+    runtimes.push(bootstrap);
+    expect(mastra.getAgent('competitorMonitor').id).toBe('competitor-monitor-agent');
+    expect(bootstrap.summaryAgent).toBeDefined();
+    const withoutChat = initializeRuntime({
+      MASTRA_DATABASE_URL: `file:${join(directory, 'without-chat-mastra.db')}`,
+      MONITOR_DATABASE_URL: `file:${join(directory, 'without-chat-monitor.db')}`,
+    });
+    runtimes.push(withoutChat);
+    expect(withoutChat.monitorAgent).toBeUndefined();
+    expect(withoutChat.summaryAgent).toBeUndefined();
+    expect(withoutChat.workflow).toBeDefined();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it('reuses durable databases from native dev through build cleanup and native start', async () => {
     const projectRoot = await mkdtemp(join(tmpdir(), 'competitor-monitor-start-'));
     const nativeDevRoot = join(projectRoot, '.mastra');
