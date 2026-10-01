@@ -65,14 +65,14 @@ export function createFinalizeStep(context: StepContext) {
         store: dependencies.store,
         agent: dependencies.summaryAgent,
       });
-      
+
       const summaryDegraded =
         report.summaryFailure !== undefined &&
         report.summaryFailure !== 'SUMMARY_DISABLED' &&
         report.summaryFailure !== 'SUMMARY_NOT_APPLICABLE';
-      
+
       const finalStatus = aggregate.status === 'success' && summaryDegraded ? 'partial' : aggregate.status;
-      
+
       const result: MonitorRunResult = {
         runId: first.runId,
         monitorId: first.monitorId,
@@ -85,7 +85,7 @@ export function createFinalizeStep(context: StepContext) {
         changes: report.changes,
         report: { summary: report.summary, summaryFailure: report.summaryFailure },
       };
-      
+
       return result;
     },
   });

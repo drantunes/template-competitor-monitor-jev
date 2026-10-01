@@ -17,12 +17,12 @@ export function createPrepareStep(context: StepContext) {
       validateEffectiveLimits(input, dependencies.config);
       const run = await dependencies.store.beginRun(input.monitorId, runId);
       const cleanUpCancellation = () => finishCanceledRun(run.id, run.monitorId);
-      
+
       if (abortSignal.aborted) {
         await cleanUpCancellation();
         throw abortSignal.reason;
       }
-      
+
       abortSignal.addEventListener(
         'abort',
         () => {
@@ -30,7 +30,7 @@ export function createPrepareStep(context: StepContext) {
         },
         { once: true },
       );
-      
+
       return input.sources.map(source => ({ runId: run.id, input, source }));
     },
   });
