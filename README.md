@@ -6,6 +6,10 @@ Tell the chat which product to monitor, share its public page URLs, and describe
 
 A page edit doesn't always mean a competitor changed its pricing or product. Navigation updates and promotional copy can distract from useful signals. This monitor keeps the evidence visible, uses Jev to assess each change, and applies a policy to ignore it, record it, request review, or flag an alert. First captures and unchanged pages without pending work need no Jev call.
 
+## Demo
+
+<video controls width="640" height="360" src="https://res.cloudinary.com/mastra-assets/video/upload/v1790883356/competitor_monitor_jev_hmoipr.mp4"></video>
+
 ## Prerequisites
 
 - **[OpenAI API key](https://platform.openai.com/api-keys)**: set `OPENAI_API_KEY` for the Studio chat. The chat uses `openai/gpt-6-luna` to understand requests and explain results. Your account needs access to this model.
