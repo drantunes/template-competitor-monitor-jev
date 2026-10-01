@@ -1,13 +1,13 @@
 import { isDeepStrictEqual } from 'node:util';
 
 import { SOURCE_LIMITS, TIMING } from '../config';
-import { assertRobotsAllowed, fetchPublicPage } from '../lib/acquisition';
+import { assertRobotsAllowed, fetchPublicPage, type AcquiredPage } from '../lib/acquisition';
 import { renderPublicPage } from '../lib/browser';
 import {
   contentForCurrentNormalization,
   diffContent,
-  normalizeHtml,
   NORMALIZATION_VERSION,
+  normalizeHtml,
   type NormalizedContent,
 } from '../lib/content';
 import type { SnapshotAcquisition } from '../lib/store';
@@ -52,21 +52,61 @@ function shortRenderShell(content: NormalizedContent, html: string, minimumConte
   );
 }
 
-function equivalentNormalizationProfile(stored: string, current: string) {
+/** Returns the stored version only when its normalization options remain compatible. */
+function compatibleNormalizationVersion(stored: string, current: string): string | undefined {
   try {
     const previous = JSON.parse(stored);
     const next = JSON.parse(current);
-    if (!previous || typeof previous !== 'object' || Array.isArray(previous)) return false;
+    if (!previous || typeof previous !== 'object' || Array.isArray(previous)) return undefined;
     const { version, ...options } = previous;
     const { version: currentVersion, ...currentOptions } = next;
-    return (
+    const compatible =
       typeof version === 'string' &&
       (version === currentVersion || /^[a-zA-Z][0-9]+-semantic-v2$/.test(version)) &&
-      isDeepStrictEqual(options, currentOptions)
-    );
+      isDeepStrictEqual(options, currentOptions);
+    return compatible ? version : undefined;
   } catch {
-    return false;
+    return undefined;
   }
+}
+
+function normalizeFetchedPage(
+  page: AcquiredPage,
+  source: MonitorSource,
+  minimumContentChars: number,
+): { content?: NormalizedContent; fallbackReason?: SnapshotAcquisition['fallbackReason'] } {
+  if (source.fetchMode === 'browser') return { fallbackReason: 'explicit_browser' };
+
+  let content: NormalizedContent;
+  try {
+    content = normalizeHtml(page.html, source);
+  } catch (error) {
+    if (source.fetchMode === 'auto' && error instanceof Error && error.message === 'CONTENT_SELECTOR_MISSING') {
+      return { fallbackReason: 'selector_missing' };
+    }
+    throw error;
+  }
+
+  if (source.fetchMode !== 'auto' || rejectedPageContent(content, page.html)) return { content };
+  if (clientRenderPlaceholder(content, minimumContentChars)) {
+    return { content, fallbackReason: 'client_render_placeholder' };
+  }
+  if (shortRenderShell(content, page.html, minimumContentChars)) {
+    return { content, fallbackReason: 'short_content' };
+  }
+  return { content };
+}
+
+function assertPublicContent(content: NormalizedContent, html: string) {
+  if (rejectedPageContent(content, html)) throw new Error('BLOCKED_OR_AUTHENTICATED_CONTENT');
+  if (content.language === 'unsupported') throw new Error('UNSUPPORTED_LANGUAGE');
+  if (content.language === 'undetermined') throw new Error('LANGUAGE_UNDETERMINED');
+}
+
+function assertContentQuality(content: NormalizedContent, minimumContentChars: number) {
+  if (content.truncated) throw new Error('NORMALIZED_CONTENT_LIMIT');
+  if (content.text.length < minimumContentChars) throw new Error('CONTENT_QUALITY_TOO_LOW');
+  if (content.lossRatio > SOURCE_LIMITS.maxContentLossRatio) throw new Error('CONTENT_QUALITY_LOSS');
 }
 
 export async function processSource(
@@ -80,10 +120,12 @@ export async function processSource(
   try {
     const deadline = AbortSignal.timeout(TIMING.acquisitionDeadlineMs);
     const acquisitionSignal = abortSignal ? AbortSignal.any([abortSignal, deadline]) : deadline;
+
     const throwIfCanceled = () => {
       if (abortSignal?.aborted) throw new Error('ACQUISITION_CANCELED');
       if (deadline.aborted) throw new Error('ACQUISITION_TIMEOUT');
     };
+
     const withinDeadline = async <T>(operation: Promise<T>) => {
       try {
         return await operation;
@@ -92,9 +134,11 @@ export async function processSource(
         throw error;
       }
     };
+
     throwIfCanceled();
     const normalizedUrl = normalizedSourceUrl(source.url);
     const storedIdentity = await dependencies.store.sourceIdentity(input.monitorId, source.id);
+
     throwIfCanceled();
     const profile = JSON.stringify({
       version: NORMALIZATION_VERSION,
@@ -102,13 +146,14 @@ export async function processSource(
       ignoreSelectors: source.ignoreSelectors,
       minContentChars: source.minContentChars,
     });
-    if (
-      storedIdentity &&
-      (storedIdentity.url !== normalizedUrl || !equivalentNormalizationProfile(storedIdentity.profile, profile))
-    ) {
+    const storedVersion = storedIdentity
+      ? compatibleNormalizationVersion(storedIdentity.profile, profile)
+      : NORMALIZATION_VERSION;
+    if (storedIdentity && (storedIdentity.url !== normalizedUrl || !storedVersion)) {
       throw new Error('SOURCE_ID_REBOUND');
     }
-    let acquired = await withinDeadline(
+
+    const fetched = await withinDeadline(
       fetchPublicPage(normalizedUrl, {
         ...dependencies,
         abortSignal: acquisitionSignal,
@@ -116,36 +161,18 @@ export async function processSource(
       }),
     );
     acquisitionCompleted = true;
-    let content: NormalizedContent | undefined;
+
     const minimumContentChars = source.minContentChars ?? SOURCE_LIMITS.minContentChars;
-    let fallbackReason:
-      'explicit_browser' | 'short_content' | 'selector_missing' | 'client_render_placeholder' | undefined;
-    if (source.fetchMode === 'browser') {
-      fallbackReason = 'explicit_browser';
-    } else {
-      try {
-        content = normalizeHtml(acquired.html, source);
-      } catch (error) {
-        if (source.fetchMode === 'auto' && error instanceof Error && error.message === 'CONTENT_SELECTOR_MISSING') {
-          fallbackReason = 'selector_missing';
-        } else {
-          throw error;
-        }
-      }
-      if (source.fetchMode === 'auto' && !fallbackReason && content && !rejectedPageContent(content, acquired.html)) {
-        if (clientRenderPlaceholder(content, minimumContentChars)) {
-          fallbackReason = 'client_render_placeholder';
-        } else if (shortRenderShell(content, acquired.html, minimumContentChars)) {
-          fallbackReason = 'short_content';
-        }
-      }
-    }
-    if (fallbackReason) {
-      acquired = await withinDeadline(renderPublicPage(acquired, { ...dependencies, abortSignal: acquisitionSignal }));
-      content = normalizeHtml(acquired.html, source);
-    }
+    const initial = normalizeFetchedPage(fetched, source, minimumContentChars);
+    const { fallbackReason } = initial;
+    const acquired = fallbackReason
+      ? await withinDeadline(renderPublicPage(fetched, { ...dependencies, abortSignal: acquisitionSignal }))
+      : fetched;
+    const content = fallbackReason ? normalizeHtml(acquired.html, source) : initial.content;
+
     if (!content) throw new Error('CONTENT_MISSING');
     throwIfCanceled();
+
     const acquisition: SnapshotAcquisition = {
       mode: fallbackReason ? 'browser' : 'http',
       finalUrl: acquired.url,
@@ -154,27 +181,29 @@ export async function processSource(
       retries: acquired.retries,
       ...(fallbackReason ? { fallbackReason } : {}),
     };
-    if (rejectedPageContent(content, acquired.html)) throw new Error('BLOCKED_OR_AUTHENTICATED_CONTENT');
-    if (content.language === 'unsupported') throw new Error('UNSUPPORTED_LANGUAGE');
-    if (content.language === 'undetermined') throw new Error('LANGUAGE_UNDETERMINED');
+
+    assertPublicContent(content, acquired.html);
+
     const baseline = await dependencies.store.baseline(input.monitorId, source.id);
     throwIfCanceled();
-    if (
-      baseline &&
-      content.text.length / Math.max(1, baseline.content.text.length) < 1 - SOURCE_LIMITS.maxContentLossRatio
-    ) {
+
+    const snapshotInput = {
+      runId,
+      monitorId: input.monitorId,
+      sourceId: source.id,
+      sourceUrl: normalizedUrl,
+      content,
+      acquisition,
+    };
+    const retainedContentRatio = baseline ? content.text.length / Math.max(1, baseline.content.text.length) : 1;
+    if (baseline && retainedContentRatio < 1 - SOURCE_LIMITS.maxContentLossRatio) {
       await dependencies.store.persistQuarantinedSnapshot({
-        runId,
-        monitorId: input.monitorId,
-        sourceId: source.id,
-        sourceUrl: normalizedUrl,
-        content,
-        acquisition,
+        ...snapshotInput,
         code: 'CONTENT_LOSS_QUARANTINED',
         reason: {
           acceptedContentChars: baseline.content.text.length,
           retrievedContentChars: content.text.length,
-          lossRatio: 1 - content.text.length / Math.max(1, baseline.content.text.length),
+          lossRatio: 1 - retainedContentRatio,
         },
       });
       return {
@@ -186,23 +215,18 @@ export async function processSource(
         },
       };
     }
-    if (content.truncated) throw new Error('NORMALIZED_CONTENT_LIMIT');
-    if (content.text.length < minimumContentChars) throw new Error('CONTENT_QUALITY_TOO_LOW');
-    if (content.lossRatio > SOURCE_LIMITS.maxContentLossRatio) throw new Error('CONTENT_QUALITY_LOSS');
+
+    assertContentQuality(content, minimumContentChars);
     if (!baseline) {
       await dependencies.store.persistAcceptedSnapshot({
-        runId,
-        monitorId: input.monitorId,
-        sourceId: source.id,
-        sourceUrl: normalizedUrl,
+        ...snapshotInput,
         normalizationProfile: profile,
-        content,
-        acquisition,
         evidence: [],
         promoteBaseline: true,
       });
       return { source: { sourceId: source.id, status: 'baseline_created', acquisitionCompleted } };
     }
+
     if (input.runMode === 'baseline') {
       throwIfCanceled();
       await dependencies.store.recordSourceOutcome(runId, source.id, 'accepted', {
@@ -214,10 +238,10 @@ export async function processSource(
         source: { sourceId: source.id, status: 'unchanged', acquisitionCompleted, outcome: 'BASELINE_ALREADY_EXISTS' },
       };
     }
+
     const baselineContent =
-      storedIdentity && JSON.parse(storedIdentity.profile).version !== NORMALIZATION_VERSION
-        ? contentForCurrentNormalization(baseline.content)
-        : baseline.content;
+      storedVersion !== NORMALIZATION_VERSION ? contentForCurrentNormalization(baseline.content) : baseline.content;
+
     if (baselineContent.hash === content.hash) {
       throwIfCanceled();
       const pendingIds = await dependencies.store.pendingIdsForSource(input.monitorId, source.id);
@@ -230,18 +254,14 @@ export async function processSource(
         },
       };
     }
+
     const evidence = diffContent(baselineContent, content);
     const candidateLimit = input.policy.maxCandidatesPerSource ?? dependencies.config.sources.candidatesPerSource;
     const warnings = evidence.length > candidateLimit ? ['CANDIDATE_LIMIT'] : [];
     throwIfCanceled();
     await dependencies.store.persistAcceptedSnapshot({
-      runId,
-      monitorId: input.monitorId,
-      sourceId: source.id,
-      sourceUrl: normalizedUrl,
+      ...snapshotInput,
       normalizationProfile: profile,
-      content,
-      acquisition,
       beforeSnapshot: baseline,
       evidence,
       promoteBaseline: true,
