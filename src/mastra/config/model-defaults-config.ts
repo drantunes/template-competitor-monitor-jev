@@ -45,6 +45,8 @@ export const EVAL_DEFAULTS = {
 export const SCHEDULE_DEFAULTS = { cron: '0 9 * * *', timezone: 'UTC' } as const;
 
 export const CHAT_DEFAULTS = {
+  // Recent messages per thread; fixed window with no env override. Resource working memory keeps durable company context.
+  lastMessages: 20,
   // Provider retries per chat request; disabled to surface failures without automatic redispatch.
   maxRetries: 0,
   model: MODEL_DEFAULTS.summary,
