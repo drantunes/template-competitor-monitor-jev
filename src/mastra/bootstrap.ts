@@ -30,8 +30,6 @@ export function initializeRuntime(environment: Readonly<Record<string, string | 
   const monitorAgent = config.credentials.openaiApiKey
     ? createCompetitorMonitorAgent(workflow, {
         id: CHAT_DEFAULTS.model,
-        url: 'https://api.openai.com/v1',
-        api: 'responses',
         apiKey: config.credentials.openaiApiKey,
       })
     : undefined;

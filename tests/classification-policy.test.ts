@@ -10,6 +10,7 @@ import { LibSQLStore } from '@mastra/libsql';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  CLASSIFIER_ID,
   COMPETITOR_CHANGE_QUESTIONS,
   QUESTION_SET_VERSION,
   classificationAbortSignal,
@@ -323,6 +324,71 @@ describe('auditable classifier policy', () => {
         confidence,
       ),
     ).toMatchObject({ route: 'review', reason: 'COMPOUND_CHANGE' });
+  });
+
+  it('preserves_baseline_pending_work_and_recovers_overflow_in_order', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'classification-limits-'));
+    const pendingConfig = loadConfig({
+      MONITOR_DATABASE_URL: `file:${join(directory, 'monitor.db')}`,
+      MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
+    });
+    const config = loadConfig({
+      MONITOR_DATABASE_URL: pendingConfig.storage.monitorUrl,
+      MASTRA_DATABASE_URL: pendingConfig.storage.mastraUrl,
+      TYPESAFE_AI_API_KEY: 'synthetic',
+    });
+    const store = MonitorStore.open(config.storage.monitorUrl);
+    const before = `<main><h1>Pricing</h1><p>Starter costs $19.</p><p>Exports are available.</p><p>Support is standard.</p>${qualityFiller}</main>`;
+    const after = `<main><h1>Pricing</h1><p>Starter costs $29.</p><p>Exports include SSO.</p><p>Support has changed.</p>${qualityFiller}</main>`;
+    const evaluated: string[] = [];
+    const classifier = () =>
+      new Classifier({
+        id: CLASSIFIER_ID,
+        model: fixtureModel(call => evaluated.push(call.state.evidence.after)),
+        questions: COMPETITOR_CHANGE_QUESTIONS,
+      });
+    const options = { generateSummary: false };
+    try {
+      await monitoredWorkflow(store, pendingConfig, () => before, classifier(), { options });
+      await monitoredWorkflow(store, pendingConfig, () => after, classifier(), { options });
+      const pending = await store.pendingCandidatesForSource('classification-monitor', 'pricing');
+      expect(pending).toHaveLength(3);
+      const baseline = await monitoredWorkflow(store, config, () => after, classifier(), {
+        runMode: 'baseline',
+        policy: { maxCandidatesPerSource: 1 },
+        options,
+      });
+      expect(baseline.changes).toEqual(
+        pending.map(candidate =>
+          expect.objectContaining({ id: candidate.candidateId, status: 'deferred', reason: 'BASELINE_MODE' }),
+        ),
+      );
+      expect(evaluated).toEqual([]);
+      expect(await store.pendingCandidatesForSource('classification-monitor', 'pricing')).toEqual(pending);
+
+      const limited = await monitoredWorkflow(store, config, () => after, classifier(), {
+        policy: { maxCandidatesPerSource: 1 },
+        options,
+      });
+      expect(limited).toMatchObject({
+        counts: { candidatesClassified: 1, candidatesDeferred: 2 },
+        changes: [
+          { id: pending[0]!.candidateId, status: 'classified' },
+          { id: pending[1]!.candidateId, status: 'deferred', reason: 'CANDIDATE_LIMIT' },
+          { id: pending[2]!.candidateId, status: 'deferred', reason: 'CANDIDATE_LIMIT' },
+        ],
+      });
+      expect(evaluated).toEqual([pending[0]!.afterText]);
+      expect(await store.pendingCandidatesForSource('classification-monitor', 'pricing')).toEqual(pending.slice(1));
+
+      const recovered = await monitoredWorkflow(store, config, () => after, classifier(), { options });
+      expect(recovered.counts).toMatchObject({ candidatesClassified: 2, candidatesDeferred: 0 });
+      expect(evaluated).toEqual(pending.map(candidate => candidate.afterText));
+      expect(await store.pendingCandidatesForSource('classification-monitor', 'pricing')).toEqual([]);
+      expect((await store.client.execute('SELECT candidate_id FROM classification_decisions')).rows).toHaveLength(3);
+    } finally {
+      await store.close();
+    }
   });
 
   it('native_classifier_preserves_audit_metadata_and_unknown_usage', async () => {

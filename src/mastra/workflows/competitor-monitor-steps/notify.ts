@@ -14,6 +14,7 @@ export function createNotifyStep(context: StepContext) {
     execute: async ({ inputData, getInitData }) => {
       const input = getInitData<MonitorInput>();
       const failures: string[] = [];
+      
       if (input.runMode === 'scheduled') {
         for (const provider of dependencies.notificationProviders ?? []) {
           const events = await dependencies.store.pendingNotifications(input.monitorId, provider.id);
@@ -27,9 +28,11 @@ export function createNotifyStep(context: StepContext) {
           }
         }
       }
+
       const result: MonitorRunResult = failures.length
         ? { ...inputData, status: inputData.status === 'failed' ? 'failed' : 'partial', notificationFailures: failures }
         : inputData;
+      
       await dependencies.store.finishRun(
         { id: result.runId, monitorId: result.monitorId, status: 'running', startedAt: '' },
         result.status === 'no_change' ? 'success' : result.status,
