@@ -41,7 +41,7 @@ class ProviderErrorTextRedactor implements SpanOutputProcessor {
 }
 
 /**
- * Stores only compact classifier telemetry locally. Workflow and model spans can contain
+ * Stores only compact classifier telemetry locally. Chat, tool, workflow and model spans can contain
  * collected page text or operator profile data, so they are never exported.
  */
 export function createLocalObservability() {
@@ -59,6 +59,8 @@ export function createLocalObservability() {
           new ProviderErrorTextRedactor(),
         ],
         excludeSpanTypes: [
+          SpanType.AGENT_RUN,
+          SpanType.TOOL_CALL,
           SpanType.WORKFLOW_RUN,
           SpanType.WORKFLOW_STEP,
           SpanType.WORKFLOW_PARALLEL,

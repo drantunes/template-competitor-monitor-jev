@@ -1,3 +1,5 @@
+import { TestSpendingLedger } from './provider-spending-ledger';
+import { PROJECT_BUDGET_USD } from './provider-spending-config';
 import { createScorer } from '@mastra/core/evals';
 import { Classifier } from '@mastra/core/classifier';
 import { Mastra } from '@mastra/core/mastra';
@@ -34,7 +36,7 @@ type WorkflowProof = {
 
 let workflowProof: WorkflowProof;
 
-describe('F5 evaluation dataset and reporting', () => {
+describe('Workflow evaluation dataset and reporting', () => {
   beforeAll(async () => {
     workflowProof = await runWorkflowProof();
   });
@@ -87,17 +89,16 @@ describe('F5 evaluation dataset and reporting', () => {
         budget: { provider: 'jev', knownUsd: 0.002 },
       },
     });
-    expect(workflowProof.report.provenance.budget?.unresolvedUsd).toBeGreaterThan(0.01);
+    expect(workflowProof.report.provenance.budget?.unresolvedUsd).toBe(0.01);
   });
 });
 
 async function runWorkflowProof(): Promise<WorkflowProof> {
-  const directory = await mkdtemp(join(tmpdir(), 'f5-product-eval-'));
+  const directory = await mkdtemp(join(tmpdir(), 'product-eval-'));
   const config = loadConfig({
     MONITOR_DATABASE_URL: `file:${join(directory, 'monitor.db')}`,
     MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
     TYPESAFE_AI_API_KEY: 'synthetic-key',
-    JEV_COST_ATTESTATION: 'typesafe-jev-2026-09-27:jev-latest',
   });
   const store = MonitorStore.open(config.storage.monitorUrl);
   let useAfterSnapshots = false;
@@ -191,14 +192,14 @@ async function runWorkflowProof(): Promise<WorkflowProof> {
       };
     },
   });
-  const framework = new LibSQLStore({ id: 'f5-product-eval', url: config.storage.mastraUrl });
+  const framework = new LibSQLStore({ id: 'product-eval', url: config.storage.mastraUrl });
   const mastra = new Mastra({
     storage: framework,
     workflows: { competitorMonitor: workflow },
     classifiers: { competitorChange: classifier },
   });
   const inputFor = (fixture: EvaluationFixture) => ({
-    monitorId: `f5-product-eval-${fixture.id}`,
+    monitorId: `product-eval-${fixture.id}`,
     runMode: 'manual' as const,
     profile: {
       name: 'Evaluator',
@@ -233,7 +234,7 @@ async function runWorkflowProof(): Promise<WorkflowProof> {
     }
     useAfterSnapshots = true;
     const gate = createScorer({
-      id: 'f5-product-workflow-route',
+      id: 'product-workflow-route',
       description: 'The persisted public workflow result reports the labeled alert route.',
       type: { input: z.any(), output: z.any() },
     }).generateScore(({ run }) => {
@@ -276,7 +277,7 @@ async function runWorkflowProof(): Promise<WorkflowProof> {
       sql: `SELECT p.source_id, p.evidence_json, c.decision_json
               FROM pending_evidence p JOIN classification_decisions c ON c.candidate_id = p.id
               WHERE p.monitor_id LIKE ?`,
-      args: ['f5-product-eval-%'],
+      args: ['product-eval-%'],
     });
     expect(persisted.rows).toHaveLength(routableFixtures.length);
     const fixtureById = new Map(routableFixtures.map(fixture => [fixture.id, fixture]));
@@ -294,24 +295,25 @@ async function runWorkflowProof(): Promise<WorkflowProof> {
           evidence.beforeText === fixture!.evidence!.beforeText && evidence.afterText === fixture!.evidence!.afterText,
       };
     });
-    const knownReservation = await store.reserveProviderBudget({
+    const spending = new TestSpendingLedger(store.client);
+    const knownReservation = await spending.reserveProviderBudget({
       provider: 'jev',
-      candidateId: 'f5-report-known',
+      candidateId: 'report-known',
       amountUsd: 0.01,
-      ceilingUsd: config.budgetUsd.jev,
+      ceilingUsd: PROJECT_BUDGET_USD.jev,
     });
     expect(knownReservation).toBeTruthy();
     expect(
-      await store.settleProviderReservation({ id: knownReservation!, knownAmountUnits: 2_000, unresolvedUnits: 0 }),
+      await spending.settleProviderReservation({ id: knownReservation!, knownAmountUnits: 2_000, unresolvedUnits: 0 }),
     ).toBe(true);
-    const unresolvedReservation = await store.reserveProviderBudget({
+    const unresolvedReservation = await spending.reserveProviderBudget({
       provider: 'jev',
-      candidateId: 'f5-report-unresolved',
+      candidateId: 'report-unresolved',
       amountUsd: 0.01,
-      ceilingUsd: config.budgetUsd.jev,
+      ceilingUsd: PROJECT_BUDGET_USD.jev,
     });
     expect(unresolvedReservation).toBeTruthy();
-    const accounting = await store.providerBudgetAccounting('jev');
+    const accounting = await spending.providerBudgetAccounting('jev');
     const report = reportEvaluation({
       datasetVersion: EVALUATION_DATASET_VERSION,
       questionSetVersion: QUESTION_SET_VERSION,
@@ -319,7 +321,7 @@ async function runWorkflowProof(): Promise<WorkflowProof> {
       observations: [...observations, ...nonroutableObservations],
       provenance: {
         model: { requested: 'fixture' },
-        budget: { provider: 'jev', ceilingUsd: config.budgetUsd.jev, ...accounting },
+        budget: { provider: 'jev', ceilingUsd: PROJECT_BUDGET_USD.jev, ...accounting },
       },
     });
     expect(report).toMatchObject({
@@ -335,10 +337,10 @@ async function runWorkflowProof(): Promise<WorkflowProof> {
       provenance: {
         model: { requested: 'fixture', reported: null, verified: null },
         usage: { inputTokens: null, outputTokens: null },
-        budget: { provider: 'jev', ceilingUsd: config.budgetUsd.jev, knownUsd: 0.002 },
+        budget: { provider: 'jev', ceilingUsd: PROJECT_BUDGET_USD.jev, knownUsd: 0.002 },
       },
     });
-    expect(report.provenance.budget?.unresolvedUsd).toBeGreaterThan(0.01);
+    expect(report.provenance.budget?.unresolvedUsd).toBe(0.01);
     expect(report.provenance.budget?.reservedUsd).toBe(
       (report.provenance.budget?.knownUsd ?? 0) + (report.provenance.budget?.unresolvedUsd ?? 0),
     );

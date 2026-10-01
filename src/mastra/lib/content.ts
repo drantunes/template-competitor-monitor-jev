@@ -6,7 +6,7 @@ import { franc } from 'franc-min';
 import { SOURCE_LIMITS } from '../config';
 
 // v2 includes a rendered anchor's own destination, so existing v1 profiles stay explicitly incompatible.
-export const NORMALIZATION_VERSION = 'f1-semantic-v2';
+export const NORMALIZATION_VERSION = 'semantic-v2';
 
 export type NormalizedSection = { key: string; context: string; text: string; hash: string };
 export type NormalizedContent = {
@@ -20,6 +20,18 @@ export type NormalizedContent = {
   lossRatio: number;
   truncated: boolean;
 };
+
+/** Rebuilds renamed semantic hashes in memory without altering the persisted capture. */
+export function contentForCurrentNormalization(content: NormalizedContent): NormalizedContent {
+  return {
+    ...content,
+    hash: hash(`${NORMALIZATION_VERSION}\n${content.text}`),
+    sections: content.sections.map(section => ({
+      ...section,
+      hash: hash(`${NORMALIZATION_VERSION}\n${section.text}`),
+    })),
+  };
+}
 
 export type Evidence = {
   id: string;

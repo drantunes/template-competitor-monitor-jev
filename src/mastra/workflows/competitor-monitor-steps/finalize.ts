@@ -1,13 +1,13 @@
 import { createStep } from '@mastra/core/workflows';
 
+import { buildReport } from '../../lib/reporting';
+import type { MonitorInput } from '../../schemas';
 import {
   classifiedSourcesSchema,
   workflowOutputSchema,
   type MonitorRunResult,
   type StepContext,
 } from './workflow-context';
-import { buildReport } from '../../lib/reporting';
-import type { MonitorInput } from '../../schemas';
 
 export function aggregateRun(
   processed: Array<{ source: MonitorRunResult['sources'][number] }>,
@@ -49,7 +49,7 @@ export function createFinalizeStep(context: StepContext) {
   const { dependencies } = context;
   return createStep({
     id: 'finalize-competitor-run',
-    description: 'Aggregates source statuses and releases the same-monitor lock after durable run completion.',
+    description: 'Aggregates source statuses and builds the grounded run report.',
     inputSchema: classifiedSourcesSchema,
     outputSchema: workflowOutputSchema,
     execute: async ({ inputData, getInitData }) => {
@@ -57,19 +57,22 @@ export function createFinalizeStep(context: StepContext) {
       const aggregate = aggregateRun(processed, inputData.changes);
       const first = processed[0]!;
       const input = getInitData<MonitorInput>();
+
       const report = await buildReport({
-        runId: first.runId,
         changes: inputData.changes,
         generateSummary: input.options.generateSummary ?? true,
         config: dependencies.config,
         store: dependencies.store,
         agent: dependencies.summaryAgent,
       });
+
       const summaryDegraded =
         report.summaryFailure !== undefined &&
         report.summaryFailure !== 'SUMMARY_DISABLED' &&
         report.summaryFailure !== 'SUMMARY_NOT_APPLICABLE';
+
       const finalStatus = aggregate.status === 'success' && summaryDegraded ? 'partial' : aggregate.status;
+
       const result: MonitorRunResult = {
         runId: first.runId,
         monitorId: first.monitorId,
@@ -82,11 +85,7 @@ export function createFinalizeStep(context: StepContext) {
         changes: report.changes,
         report: { summary: report.summary, summaryFailure: report.summaryFailure },
       };
-      await dependencies.store.finishRun(
-        { id: first.runId, monitorId: first.monitorId, status: 'running', startedAt: '' },
-        finalStatus === 'no_change' ? 'success' : finalStatus,
-        result,
-      );
+
       return result;
     },
   });

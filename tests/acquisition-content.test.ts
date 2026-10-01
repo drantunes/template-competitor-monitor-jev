@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import https from 'node:https';
 
@@ -9,6 +12,9 @@ import {
   type DnsResolver,
   type PinnedTransport,
 } from '../src/mastra/lib/acquisition';
+import { loadConfig } from '../src/mastra/config';
+import { MonitorStore } from '../src/mastra/lib/store';
+import { processSource } from '../src/mastra/workflows/source-processing';
 import { diffContent, normalizeHtml } from '../src/mastra/lib/content';
 import { validateMonitorInput } from '../src/mastra/schemas';
 
@@ -16,6 +22,85 @@ const publicDns: DnsResolver = async () => [{ address: '93.184.216.34', family: 
 const bytes = (text: string) => new TextEncoder().encode(text);
 
 describe('acquisition and semantic content', () => {
+  it('rejects_robots_denied_redirect_before_request', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'monitor-robots-redirect-'));
+    const store = MonitorStore.open(`file:${join(directory, 'monitor.db')}`);
+    const config = loadConfig({ MONITOR_DATABASE_URL: `file:${join(directory, 'monitor.db')}` });
+    const input = validateMonitorInput({
+      monitorId: 'robots-monitor',
+      profile: { name: 'Robots monitor', interests: ['pricing'] },
+      sources: [
+        { id: 'pricing', label: 'Pricing', url: 'https://public.example/pricing', kind: 'pricing', fetchMode: 'http' },
+      ],
+    });
+    let redirectMode: 'none' | 'direct' | 'chain' = 'none';
+    const requests: string[] = [];
+    const transport: PinnedTransport = async ({ url }) => {
+      requests.push(url.pathname);
+      if (url.pathname === '/robots.txt')
+        return { status: 302, headers: { location: '/robots-policy' }, body: bytes('') };
+      if (url.pathname === '/robots-policy')
+        return {
+          status: 200,
+          headers: { 'content-type': 'text/plain' },
+          body: bytes('User-agent: *\nDisallow: /forbidden\nAllow: /'),
+        };
+      if (redirectMode !== 'none')
+        return {
+          status: 302,
+          headers: { location: redirectMode === 'chain' && url.pathname === '/pricing' ? '/hop' : '/forbidden' },
+          body: bytes(''),
+        };
+      return {
+        status: 200,
+        headers: { 'content-type': 'text/html' },
+        body: bytes(
+          '<main><h1>Pricing</h1><p>' +
+            'Public pricing and clear product documentation for growing teams. '.repeat(8) +
+            '</p></main>',
+        ),
+      };
+    };
+    try {
+      const baselineRun = await store.beginRun(input.monitorId);
+      await processSource(input, baselineRun.id, input.sources[0]!, { store, config, resolver: publicDns, transport });
+      await store.finishRun(baselineRun, 'success', {});
+      const baseline = await store.baseline(input.monitorId, 'pricing');
+      for (const mode of ['direct', 'chain'] as const) {
+        redirectMode = mode;
+        requests.splice(0);
+        const run = await store.beginRun(input.monitorId);
+        await expect(
+          processSource(input, run.id, input.sources[0]!, { store, config, resolver: publicDns, transport }),
+        ).rejects.toThrow('ROBOTS_DENIED');
+        expect(requests).not.toContain('/forbidden');
+        expect(requests.filter(path => path === '/robots.txt')).toHaveLength(mode === 'direct' ? 2 : 3);
+        expect((await store.baseline(input.monitorId, 'pricing'))?.id).toBe(baseline?.id);
+        expect(await store.pendingForRun(run.id)).toEqual([]);
+        await store.finishRun(run, 'failed', {});
+      }
+    } finally {
+      await store.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['', 'javascript', 'application/javascript\r\nX-Injected: yes', 'text/html-invalid'])(
+    'rejects missing or invalid document MIME %j',
+    async contentType => {
+      await expect(
+        fetchPublicPage('https://public.example/', {
+          resolver: publicDns,
+          transport: async () => ({
+            status: 200,
+            headers: { 'content-type': contentType },
+            body: bytes('<main>public</main>'),
+          }),
+        }),
+      ).rejects.toThrow('INVALID_CONTENT_TYPE');
+    },
+  );
+
   it('rejects_private_redirect_and_rebinding', async () => {
     const privateRedirect: PinnedTransport = async ({ url }) => ({
       status: 302,

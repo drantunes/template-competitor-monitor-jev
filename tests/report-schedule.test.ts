@@ -9,14 +9,13 @@ import { LibSQLStore } from '@mastra/libsql';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { loadConfig, MODEL_DEFAULTS, POLICY_DEFAULTS } from '../src/mastra/config';
-import { SUMMARY_RESERVATION_USD } from '../src/mastra/config/jev-config';
 import {
   buildReport,
   createReportSummaryAgent,
   REPORT_SUMMARY_AGENT_ID,
   type SummaryAgent,
 } from '../src/mastra/lib/reporting';
-import { ensureWeeklyMonitorSchedule, monitorScheduleHistory } from '../src/mastra/lib/schedules';
+import { ensureDailyMonitorSchedule, monitorScheduleHistory } from '../src/mastra/lib/schedules';
 import { MonitorStore } from '../src/mastra/lib/store';
 import { createCompetitorMonitorWorkflow } from '../src/mastra/workflows/competitor-monitor-workflow';
 import { COMPETITOR_CHANGE_QUESTIONS, QUESTION_SET_VERSION, RULE_VERSION } from '../src/mastra/lib/classification';
@@ -205,7 +204,6 @@ describe('grounded reports and native schedules', () => {
       MONITOR_DATABASE_URL: `file:${join(directory, 'monitor.db')}`,
       MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
       TYPESAFE_AI_API_KEY: 'fixture',
-      JEV_COST_ATTESTATION: 'typesafe-jev-2026-09-27:jev-latest',
     });
     const workflowStore = MonitorStore.open(workflowConfig.storage.monitorUrl);
     stores.push(workflowStore);
@@ -282,7 +280,6 @@ describe('grounded reports and native schedules', () => {
       },
     });
     const disabled = await buildReport({
-      runId,
       changes: [change],
       generateSummary: false,
       config,
@@ -297,7 +294,6 @@ describe('grounded reports and native schedules', () => {
       ruleVersion: storedProvenance.ruleVersion,
     });
     const withoutClassification = await buildReport({
-      runId,
       changes: [
         {
           id: 'without-persisted-classification',
@@ -317,12 +313,10 @@ describe('grounded reports and native schedules', () => {
     } as SummaryAgent;
     const enabledConfig = loadConfig({
       OPENAI_API_KEY: 'synthetic-key',
-      OPENAI_COST_ATTESTATION: 'openai-gpt-6-luna-2026-09-29:openai/gpt-6-luna',
       MONITOR_DATABASE_URL: config.storage.monitorUrl,
       MASTRA_DATABASE_URL: config.storage.mastraUrl,
     });
     const failed = await buildReport({
-      runId,
       changes: [change],
       generateSummary: true,
       config: enabledConfig,
@@ -332,34 +326,9 @@ describe('grounded reports and native schedules', () => {
     expect(failed).toMatchObject({ summaryFailure: 'SUMMARY_FAILED', changes: disabled.changes });
   });
 
-  it('summary_model_and_openai_budget_are_enforced', async () => {
-    const { config, store, runId } = await seededReport({
-      OPENAI_API_KEY: 'synthetic-key',
-      OPENAI_COST_ATTESTATION: 'openai-gpt-6-luna-2026-09-29:openai/gpt-6-luna',
-      OPENAI_BUDGET_USD: '0',
-    });
-    const pending = await store.pendingForRun(runId);
-    const report = await buildReport({
-      runId,
-      changes: [{ id: pending[0]!.id, sourceId: 'pricing', status: 'classified', route: 'review' }],
-      generateSummary: true,
-      config,
-      store,
-      agent: { generate: async () => Promise.reject(new Error(REPORT_SUMMARY_AGENT_ID)) } as SummaryAgent,
-    });
-    expect(report.summaryFailure).toBe('BUDGET_EXHAUSTED');
-    expect(SUMMARY_RESERVATION_USD).toBeGreaterThan(0);
-    expect(config.models).toMatchObject({
-      summary: 'openai/gpt-6-luna',
-      summaryReasoning: 'none',
-      summaryMaxInputTokens: 8000,
-      summaryMaxOutputTokens: 800,
-    });
-
+  it('uses the configured summary model and request bounds with sanitized failures', async () => {
     const liveShape = await seededReport({
       OPENAI_API_KEY: 'synthetic-key',
-      OPENAI_COST_ATTESTATION: 'openai-gpt-6-luna-2026-09-29:openai/gpt-6-luna',
-      OPENAI_BUDGET_USD: '0.01',
     });
     const originalFetch = globalThis.fetch;
     const loggedErrors: unknown[][] = [];
@@ -375,7 +344,6 @@ describe('grounded reports and native schedules', () => {
     };
     try {
       const result = await buildReport({
-        runId: liveShape.runId,
         changes: [
           {
             id: 'prompt-marker',
@@ -412,18 +380,11 @@ describe('grounded reports and native schedules', () => {
     });
     expect(inspect(request?.body, { depth: null })).toContain('prompt-marker');
     expect(request?.authorization).toContain('credential-marker');
-    // The failed dispatched call remains reserved, and the separate OpenAI ledger survives a reopen.
-    expect(await liveShape.store.reservedProviderUsd('openai')).toBe(SUMMARY_RESERVATION_USD);
-    const reopened = MonitorStore.open(liveShape.config.storage.monitorUrl);
-    stores.push(reopened);
-    expect(await reopened.reservedProviderUsd('openai')).toBe(SUMMARY_RESERVATION_USD);
   });
 
-  it('settles completed summary usage and retains incomplete attempts', async () => {
+  it('validates summary evidence independently of provider usage availability', async () => {
     const { config, store, runId } = await seededReport({
       OPENAI_API_KEY: 'synthetic-key',
-      OPENAI_COST_ATTESTATION: 'openai-gpt-6-luna-2026-09-29:openai/gpt-6-luna',
-      OPENAI_BUDGET_USD: '0.01',
     });
     const pending = await store.pendingForRun(runId);
     const change = { id: pending[0]!.id, sourceId: 'pricing', status: 'classified' as const, route: 'alert' as const };
@@ -434,7 +395,6 @@ describe('grounded reports and native schedules', () => {
     };
 
     const successful = await buildReport({
-      runId,
       changes: [change],
       generateSummary: true,
       config,
@@ -447,7 +407,6 @@ describe('grounded reports and native schedules', () => {
       } as unknown as SummaryAgent,
     });
     const invalidCitation = await buildReport({
-      runId,
       changes: [change],
       generateSummary: true,
       config,
@@ -460,70 +419,34 @@ describe('grounded reports and native schedules', () => {
       } as unknown as SummaryAgent,
     });
     const missingUsage = await buildReport({
-      runId,
       changes: [change],
       generateSummary: true,
       config,
       store,
       agent: { generate: async () => ({ object: validObject }) } as unknown as SummaryAgent,
     });
-    const overReservedUsage = await buildReport({
-      runId,
-      changes: [change],
-      generateSummary: true,
-      config,
-      store,
-      agent: {
-        generate: async () => ({
-          object: validObject,
-          usage: {
-            inputTokens: MODEL_DEFAULTS.summaryMaxInputTokens + 1,
-            outputTokens: MODEL_DEFAULTS.summaryMaxOutputTokens,
-          },
-        }),
-      } as unknown as SummaryAgent,
-    });
-
     expect(successful).toMatchObject({ summary: validObject });
     expect(invalidCitation.summaryFailure).toBe('SUMMARY_INVALID');
     expect(missingUsage).toMatchObject({ summary: validObject });
-    expect(overReservedUsage.summaryFailure).toBe('SUMMARY_USAGE_UNRECONCILED');
-    const reservations = await store.client.execute({
-      sql: `SELECT amount_units, known_amount_units, unresolved_units, status
-            FROM provider_reservations WHERE provider = 'openai' ORDER BY created_at, rowid`,
-    });
-    expect(reservations.rows).toEqual([
-      { amount_units: 1200, known_amount_units: 20, unresolved_units: 0, status: 'settled' },
-      { amount_units: 1200, known_amount_units: 7, unresolved_units: 0, status: 'settled' },
-      { amount_units: 1200, known_amount_units: null, unresolved_units: 1200, status: 'uncertain' },
-      { amount_units: 1200, known_amount_units: null, unresolved_units: 1200, status: 'uncertain' },
-    ]);
-    expect(await store.reservedProviderUsd('openai')).toBe(0.002427);
   });
-
   it('keeps the native summary agent internal and validates bounded summary evidence before dispatch', async () => {
-    const { config, store, runId } = await seededReport({
-      OPENAI_API_KEY: 'synthetic-key',
-      OPENAI_COST_ATTESTATION: 'openai-gpt-6-luna-2026-09-29:openai/gpt-6-luna',
-      OPENAI_BUDGET_USD: '0',
-    });
+    const { config, store, runId } = await seededReport({});
     const pending = await store.pendingForRun(runId);
-    let exhaustedCalls = 0;
-    const exhausted = await buildReport({
-      runId,
+    let unconfiguredCalls = 0;
+    const unconfigured = await buildReport({
       changes: [{ id: pending[0]!.id, sourceId: 'pricing', status: 'classified', route: 'alert' }],
       generateSummary: true,
       config,
       store,
       agent: {
         generate: async () => {
-          exhaustedCalls += 1;
+          unconfiguredCalls += 1;
           throw new Error('UNEXPECTED_DISPATCH');
         },
       } as unknown as SummaryAgent,
     });
-    expect(exhausted.summaryFailure).toBe('BUDGET_EXHAUSTED');
-    expect(exhaustedCalls).toBe(0);
+    expect(unconfigured.summaryFailure).toBe('SUMMARY_NOT_CONFIGURED');
+    expect(unconfiguredCalls).toBe(0);
 
     const runtimeFramework = new LibSQLStore({ id: 'internal-summary-framework', url: config.storage.mastraUrl });
     frameworks.push(runtimeFramework);
@@ -536,8 +459,6 @@ describe('grounded reports and native schedules', () => {
 
     const enabled = loadConfig({
       OPENAI_API_KEY: 'synthetic-key',
-      OPENAI_COST_ATTESTATION: 'openai-gpt-6-luna-2026-09-29:openai/gpt-6-luna',
-      OPENAI_BUDGET_USD: '0.01',
       MONITOR_DATABASE_URL: config.storage.monitorUrl,
       MASTRA_DATABASE_URL: config.storage.mastraUrl,
     });
@@ -556,7 +477,6 @@ describe('grounded reports and native schedules', () => {
       },
     } as SummaryAgent;
     const valid = await buildReport({
-      runId,
       changes: [change],
       generateSummary: true,
       config: enabled,
@@ -567,7 +487,6 @@ describe('grounded reports and native schedules', () => {
     expect(calls).toBe(1);
 
     const invalidId = await buildReport({
-      runId,
       changes: [change],
       generateSummary: true,
       config: enabled,
@@ -579,7 +498,6 @@ describe('grounded reports and native schedules', () => {
       } as unknown as SummaryAgent,
     });
     const invalidQuote = await buildReport({
-      runId,
       changes: [change],
       generateSummary: true,
       config: enabled,
@@ -593,9 +511,7 @@ describe('grounded reports and native schedules', () => {
     expect(invalidId.summaryFailure).toBe('SUMMARY_INVALID');
     expect(invalidQuote.summaryFailure).toBe('SUMMARY_INVALID');
 
-    const reservedBeforeNoDispatch = await store.reservedProviderUsd('openai');
     const ignored = await buildReport({
-      runId,
       changes: [
         { ...change, route: 'ignore' },
         { ...change, id: 'record-only', route: 'record' },
@@ -606,7 +522,6 @@ describe('grounded reports and native schedules', () => {
       agent: validAgent,
     });
     const tooLarge = await buildReport({
-      runId,
       changes: [
         {
           id: 'oversized',
@@ -643,7 +558,6 @@ describe('grounded reports and native schedules', () => {
       MODEL_DEFAULTS.summaryMaxInputTokens,
     );
     const hostileUnicode = await buildReport({
-      runId,
       changes: [
         {
           id: 'hostile-unicode',
@@ -666,7 +580,6 @@ describe('grounded reports and native schedules', () => {
     expect(tooLarge.summaryFailure).toBe('SUMMARY_EVIDENCE_TOO_LARGE');
     expect(hostileUnicode.summaryFailure).toBe('SUMMARY_EVIDENCE_TOO_LARGE');
     expect(calls).toBe(1);
-    expect(await store.reservedProviderUsd('openai')).toBe(reservedBeforeNoDispatch);
   });
 
   it('native_schedule_persists_and_runs_same_workflow', async () => {
@@ -694,8 +607,8 @@ describe('grounded reports and native schedules', () => {
       }),
     });
     const mastra = new Mastra({ storage: framework, workflows: { competitorMonitor: workflow } });
-    const schedule = await ensureWeeklyMonitorSchedule(mastra, input() as any);
-    const repeated = await ensureWeeklyMonitorSchedule(mastra, input() as any);
+    const schedule = await ensureDailyMonitorSchedule(mastra, input() as any);
+    const repeated = await ensureDailyMonitorSchedule(mastra, input() as any);
     expect(repeated.id).toBe(schedule.id);
     await mastra.schedules.pause(schedule.id);
     expect((await mastra.schedules.get(schedule.id))?.status).toBe('paused');
@@ -767,7 +680,6 @@ describe('grounded reports and native schedules', () => {
       MONITOR_DATABASE_URL: `file:${join(directory, 'monitor.db')}`,
       MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
       TYPESAFE_AI_API_KEY: 'fixture',
-      JEV_COST_ATTESTATION: 'typesafe-jev-2026-09-27:jev-latest',
     });
     const store = MonitorStore.open(config.storage.monitorUrl);
     stores.push(store);

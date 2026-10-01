@@ -6,7 +6,13 @@ import { StagehandBrowser } from '@mastra/stagehand';
 import { launch, type LaunchedChrome } from 'chrome-launcher';
 
 import { SOURCE_LIMITS, TIMING } from '../config';
-import { fetchPublicPage, type AcquiredPage, type DnsResolver, type PinnedTransport } from './acquisition';
+import {
+  assertRobotsAllowed,
+  fetchPublicPage,
+  type AcquiredPage,
+  type DnsResolver,
+  type PinnedTransport,
+} from './acquisition';
 
 type CdpMessage = {
   id?: number;
@@ -200,7 +206,7 @@ export async function renderPublicPage(initial: AcquiredPage, options: BrowserRe
   let resourceFetches = Promise.resolve();
   let resourceLimitError: Error | undefined;
   const limitResources = () => (resourceLimitError ??= new Error('BROWSER_RESOURCE_LIMIT'));
-  const fetchNextResource = (resourceUrl: URL) => {
+  const fetchNextResource = (resourceUrl: URL, isDocument: boolean) => {
     const operation = async () => {
       if (resourceLimitError) throw resourceLimitError;
       resources += 1;
@@ -211,7 +217,14 @@ export async function renderPublicPage(initial: AcquiredPage, options: BrowserRe
           : await fetchPublicPage(resourceUrl.href, {
               ...options,
               abortSignal: controller.signal,
-              acceptedContentTypes: /./,
+              acceptedContentTypes:
+                /^(?:text\/html|application\/xhtml\+xml|(?:text|application)\/(?:javascript|ecmascript))$/i,
+              ...(isDocument
+                ? {
+                    beforeRequest: (url: URL) =>
+                      assertRobotsAllowed(url.href, { ...options, abortSignal: controller.signal }),
+                  }
+                : {}),
             });
       const resourceBytes = Buffer.byteLength(resource.html);
       if (bytes + resourceBytes > SOURCE_LIMITS.maxHtmlBytes) throw limitResources();
@@ -300,16 +313,14 @@ export async function renderPublicPage(initial: AcquiredPage, options: BrowserRe
         return;
       }
       try {
-        const resource = await fetchNextResource(resourceUrl);
+        const resource = await fetchNextResource(resourceUrl, message.params?.resourceType === 'Document');
         await cdp!.send('Fetch.fulfillRequest', {
           requestId,
           responseCode: resource.status,
           responseHeaders: [
             {
               name: 'Content-Type',
-              value: /\.m?js(?:$|\?)/i.test(resourceUrl.pathname)
-                ? 'application/javascript'
-                : 'text/html; charset=utf-8',
+              value: `${resource.contentType}; charset=utf-8`,
             },
             { name: 'Access-Control-Allow-Origin', value: '*' },
             { name: 'Content-Security-Policy', value: cspHeader() },
@@ -367,6 +378,7 @@ export async function renderPublicPage(initial: AcquiredPage, options: BrowserRe
       html,
       url: initial.url,
       status: initial.status,
+      contentType: initial.contentType,
       retries: initial.retries,
       durationMs: initial.durationMs + Date.now() - startedAt,
     };

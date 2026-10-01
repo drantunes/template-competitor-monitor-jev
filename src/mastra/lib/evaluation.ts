@@ -3,7 +3,7 @@ import { POLICY_DEFAULTS } from '../config';
 
 export type EvaluationSplit = 'calibration' | 'held-out';
 
-export const LIVE_EVALUATION_DATASET_VERSION = 'f5-live-held-out-v1';
+export const LIVE_EVALUATION_DATASET_VERSION = 'live-held-out-v1';
 
 export type EvaluationObservation = {
   id: string;

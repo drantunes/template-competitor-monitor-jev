@@ -3,17 +3,33 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { createHonoServer } from '@mastra/deployer/server';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { MastraStorageExporter } from '@mastra/observability';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { loadConfig } from '../src/mastra/config';
 import { normalizeHtml } from '../src/mastra/lib/content';
 
 type Runtime = ReturnType<typeof import('../src/mastra/bootstrap').initializeRuntime>;
 const runtimes: Runtime[] = [];
+// Capture the native public async initialization before importing the runtime entry point.
+const exporterInitializations: Promise<void>[] = [];
+const originalExporterInit = MastraStorageExporter.prototype.init;
+beforeEach(() => {
+  vi.spyOn(MastraStorageExporter.prototype, 'init').mockImplementation(function (this: MastraStorageExporter, ...args) {
+    const initialized = originalExporterInit.apply(this, args);
+    exporterInitializations.push(initialized);
+    return initialized;
+  });
+});
+async function closeRuntime(runtime: Runtime) {
+  await Promise.all(exporterInitializations);
+  await runtime.observability.shutdown();
+  await runtime.applicationStore.close();
+  await runtime.frameworkStore.close();
+}
 afterEach(async () => {
-  await Promise.all(
-    runtimes.splice(0).flatMap(runtime => [runtime.applicationStore.close(), runtime.frameworkStore.close()]),
-  );
+  for (const runtime of runtimes.splice(0)) await closeRuntime(runtime);
+  exporterInitializations.splice(0);
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
   vi.resetModules();
@@ -35,6 +51,50 @@ async function productionApp(token: string) {
 }
 
 describe('native Mastra SimpleAuth', () => {
+  it('runtime_observability_closes_before_framework_storage', async () => {
+    await productionApp('synthetic-shutdown-token');
+    const runtime = runtimes.at(-1)!;
+    expect(exporterInitializations.length).toBeGreaterThan(0);
+    const order: string[] = [];
+    const shutdown = runtime.observability.shutdown.bind(runtime.observability);
+    const close = runtime.frameworkStore.close.bind(runtime.frameworkStore);
+    vi.spyOn(runtime.observability, 'shutdown').mockImplementation(async () => {
+      await shutdown();
+      order.push('observability');
+    });
+    vi.spyOn(runtime.frameworkStore, 'close').mockImplementation(async () => {
+      expect(order).toEqual(['observability']);
+      await close();
+      order.push('storage');
+    });
+    await closeRuntime(runtime);
+    runtimes.splice(runtimes.indexOf(runtime), 1);
+    expect(order).toEqual(['observability', 'storage']);
+  });
+
+  it('registers OpenAI chat without provider calls during initialization', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'competitor-monitor-chat-init-'));
+    vi.stubEnv('EXECUTION_MODE', 'local');
+    vi.stubEnv('OPENAI_API_KEY', 'synthetic-chat-key');
+    vi.stubEnv('MASTRA_DATABASE_URL', `file:${join(directory, 'mastra.db')}`);
+    vi.stubEnv('MONITOR_DATABASE_URL', `file:${join(directory, 'monitor.db')}`);
+    const fetch = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('UNEXPECTED_PROVIDER_CALL'));
+    const { mastra } = await import('../src/mastra/index');
+    const { bootstrap, initializeRuntime } = await import('../src/mastra/bootstrap');
+    runtimes.push(bootstrap);
+    expect(mastra.getAgent('competitorMonitor').id).toBe('competitor-monitor-agent');
+    expect(bootstrap.summaryAgent).toBeDefined();
+    const withoutChat = initializeRuntime({
+      MASTRA_DATABASE_URL: `file:${join(directory, 'without-chat-mastra.db')}`,
+      MONITOR_DATABASE_URL: `file:${join(directory, 'without-chat-monitor.db')}`,
+    });
+    runtimes.push(withoutChat);
+    expect(withoutChat.monitorAgent).toBeUndefined();
+    expect(withoutChat.summaryAgent).toBeUndefined();
+    expect(withoutChat.workflow).toBeDefined();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it('reuses durable databases from native dev through build cleanup and native start', async () => {
     const projectRoot = await mkdtemp(join(tmpdir(), 'competitor-monitor-start-'));
     const nativeDevRoot = join(projectRoot, '.mastra');
@@ -76,8 +136,7 @@ describe('native Mastra SimpleAuth', () => {
     expect(loadConfig({ MASTRA_PROJECT_ROOT: nativeDevRoot }).storage.monitorUrl).toContain(
       `${nativeDevRoot}/.data/competitor-monitor.db`,
     );
-    await first.applicationStore.close();
-    await first.frameworkStore.close();
+    await closeRuntime(first);
     runtimes.splice(runtimes.indexOf(first), 1);
     // Native build preparation wipes only this temporary project's build area.
     await rm(nativeDevRoot, { recursive: true });

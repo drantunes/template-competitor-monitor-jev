@@ -1,22 +1,21 @@
+import {
+  CLASSIFICATION_LIMITS,
+  PRICING_REFERENCE,
+  PROJECT_BUDGET_USD,
+  JEV_TEST_CALL_RESERVATION_USD,
+} from './provider-spending-config';
+import { TestSpendingLedger } from './provider-spending-ledger';
 import { createTypeSafeAi } from '@ai-sdk/typesafe-ai';
 import { Classifier } from '@mastra/core/classifier';
 import { Mastra } from '@mastra/core/mastra';
 import { LibSQLStore } from '@mastra/libsql';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import {
-  CLASSIFICATION_LIMITS,
-  PRICING_REFERENCE,
-  PROJECT_BUDGET_USD,
-  SOURCE_LIMITS,
-  TIMING,
-  loadConfig,
-} from '../src/mastra/config';
+import { SOURCE_LIMITS, TIMING, loadConfig } from '../src/mastra/config';
 import {
   classificationState,
   COMPETITOR_CHANGE_QUESTIONS,
   CLASSIFIER_ID,
-  JEV_RESERVATION_USD,
   QUESTION_SET_VERSION,
   RULE_VERSION,
   routeClassification,
@@ -36,27 +35,69 @@ afterEach(async () => {
 });
 
 function liveInput(): MonitorInput {
-  const raw = process.env.F5_LIVE_INPUT_JSON;
-  expect(raw, 'F5_LIVE_INPUT_JSON must contain the documented real-source monitor input').toBeTruthy();
+  const raw = process.env.LIVE_MONITOR_INPUT_JSON;
+  expect(raw, 'LIVE_MONITOR_INPUT_JSON must contain the documented real-source monitor input').toBeTruthy();
   const input = validateMonitorInput(JSON.parse(raw!));
   expect(new Set(input.sources.map(source => source.kind))).toEqual(new Set(['pricing', 'changelog', 'documentation']));
-  expect(input.options.generateSummary, 'F5 live selectors do not configure a summary agent').toBe(false);
+  expect(input.options.generateSummary, 'Live selectors do not configure a summary agent').toBe(false);
   return input;
 }
 
 function createLiveClassifier(config: ReturnType<typeof loadConfig>) {
-  return new Classifier({
-    id: CLASSIFIER_ID,
-    model: createTypeSafeAi({ apiKey: config.credentials.jevApiKey!, baseURL: config.jev.baseURL }).evaluationModel(
-      config.models.jev,
-    ),
-    questions: COMPETITOR_CHANGE_QUESTIONS,
-  });
+  const expectedAttestation =
+    config.jev.accessMode === 'vercel-gateway'
+      ? `vercel-ai-gateway-typesafe-2026-09-29:${config.models.jev}`
+      : `typesafe-jev-2026-09-27:${config.models.jev}`;
+  expect(process.env.JEV_COST_ATTESTATION, 'Paid tests require a verified tariff').toBe(expectedAttestation);
+  const model = createTypeSafeAi({
+    apiKey: config.credentials.jevApiKey!,
+    baseURL: config.jev.baseURL,
+  }).evaluationModel(config.models.jev);
+  const spending = new TestSpendingLedger(monitorStore!.client);
+  const guardedModel: typeof model = {
+    specificationVersion: model.specificationVersion,
+    provider: model.provider,
+    supportedQuestionTypes: model.supportedQuestionTypes,
+    modelId: model.modelId,
+    async doEvaluate(options) {
+      // Native retries call this method again; each attempted provider call reserves independently.
+      const id = await spending.reserveProviderBudget({
+        provider: 'jev',
+        candidateId: 'live-test-evaluation',
+        amountUsd: JEV_TEST_CALL_RESERVATION_USD,
+        ceilingUsd: PROJECT_BUDGET_USD.jev,
+      });
+      if (!id) throw new Error('TEST_JEV_BUDGET_EXHAUSTED');
+      const result = await model.doEvaluate(options);
+      const { inputTokens, outputTokens } = result.usage ?? {};
+      if (
+        typeof inputTokens === 'number' &&
+        typeof outputTokens === 'number' &&
+        Number.isSafeInteger(inputTokens) &&
+        Number.isSafeInteger(outputTokens) &&
+        inputTokens >= 0 &&
+        outputTokens >= 0
+      ) {
+        await spending.settleProviderReservation({
+          id,
+          knownAmountUnits: Math.ceil(
+            ((inputTokens * PRICING_REFERENCE.jevInputUsdPerMillion +
+              outputTokens * PRICING_REFERENCE.jevOutputUsdPerMillion) /
+              PRICING_REFERENCE.tokensPerPricingUnit) *
+              CLASSIFICATION_LIMITS.usdReservationUnits,
+          ),
+          unresolvedUnits: 0,
+        });
+      }
+      return result;
+    },
+  };
+  return new Classifier({ id: CLASSIFIER_ID, model: guardedModel, questions: COMPETITOR_CHANGE_QUESTIONS });
 }
 
 async function verifyManualStudioSmoke(config: ReturnType<typeof loadConfig>, input: MonitorInput) {
-  const raw = process.env.F5_MANUAL_STUDIO_SMOKE_RECORD_JSON;
-  expect(raw, 'F5_MANUAL_STUDIO_SMOKE_RECORD_JSON must contain the retained Studio run record').toBeTruthy();
+  const raw = process.env.MANUAL_STUDIO_SMOKE_RECORD_JSON;
+  expect(raw, 'MANUAL_STUDIO_SMOKE_RECORD_JSON must contain the retained Studio run record').toBeTruthy();
   const record = JSON.parse(raw!) as Record<string, unknown>;
   expect(typeof record.nativeWorkflowRunId).toBe('string');
   expect(typeof record.monitorId).toBe('string');
@@ -66,7 +107,7 @@ async function verifyManualStudioSmoke(config: ReturnType<typeof loadConfig>, in
   expect(Date.parse(String(record.observedAt))).toBeLessThanOrEqual(Date.now());
   expect(record.monitorId).toBe(input.monitorId);
   const source = input.sources.find(item => item.id === record.sourceId);
-  expect(source, 'Smoke record source must be in F5_LIVE_INPUT_JSON').toBeTruthy();
+  expect(source, 'Smoke record source must be in LIVE_MONITOR_INPUT_JSON').toBeTruthy();
   expect(record.sourceUrl).toBe(new URL(source!.url).toString());
   const smokeSources = Array.isArray(record.sources) ? record.sources : [];
   const smokeSource = smokeSources.find(
@@ -101,7 +142,7 @@ async function verifyManualStudioSmoke(config: ReturnType<typeof loadConfig>, in
  * This selector is intentionally separate from offline fixtures. It never substitutes
  * synthetic acquisition, baseline, or classifier output for a live demonstration.
  */
-describe('F5 live evaluation prerequisites', () => {
+describe('Live evaluation prerequisites', () => {
   it(
     'npm_quickstart_runs_demo_workflow',
     async () => {
@@ -119,7 +160,6 @@ describe('F5 live evaluation prerequisites', () => {
       const input = liveInput();
       await verifyManualStudioSmoke(config, input);
       expect(config.credentials.jevApiKey, 'The selected Jev access mode requires its configured API key').toBeTruthy();
-      expect(config.billing.jevCostAttested, 'JEV_COST_ATTESTATION must match the configured live model').toBe(true);
       monitorStore ??= MonitorStore.open(config.storage.monitorUrl);
       await monitorStore.init();
       const previousBaselines = new Map(
@@ -132,7 +172,7 @@ describe('F5 live evaluation prerequisites', () => {
 
       const classifier = createLiveClassifier(config);
       const workflow = createCompetitorMonitorWorkflow({ store: monitorStore, config });
-      frameworkStore = new LibSQLStore({ id: 'f5-live-evaluation', url: config.storage.mastraUrl });
+      frameworkStore = new LibSQLStore({ id: 'live-evaluation', url: config.storage.mastraUrl });
       const mastra = new Mastra({
         storage: frameworkStore,
         workflows: { competitorMonitor: workflow },
@@ -170,11 +210,10 @@ describe('F5 live evaluation prerequisites', () => {
       const input = liveInput();
       await verifyManualStudioSmoke(config, input);
       expect(config.credentials.jevApiKey, 'The selected Jev access mode requires its configured API key').toBeTruthy();
-      expect(config.billing.jevCostAttested, 'JEV_COST_ATTESTATION must match the configured live model').toBe(true);
-      const cases = JSON.parse(process.env.F5_LIVE_EVALUATION_CASES_JSON ?? '[]') as Array<any>;
+      const cases = JSON.parse(process.env.LIVE_EVALUATION_CASES_JSON ?? '[]') as Array<any>;
       expect(
         cases.length,
-        'F5_LIVE_EVALUATION_CASES_JSON must contain labeled held-out operator-supplied evidence',
+        'LIVE_EVALUATION_CASES_JSON must contain labeled held-out operator-supplied evidence',
       ).toBeGreaterThan(0);
       expect(cases.length).toBeLessThanOrEqual(SOURCE_LIMITS.maxCandidatesPerSource);
       const seenIds = new Set<string>();
@@ -214,13 +253,6 @@ describe('F5 live evaluation prerequisites', () => {
       let completeInputUsage = true;
       let completeOutputUsage = true;
       for (const { item, state } of validatedCases) {
-        const reservation = await monitorStore.reserveProviderBudget({
-          provider: 'jev',
-          candidateId: `f5-live-evaluation:${item.id}`,
-          amountUsd: JEV_RESERVATION_USD,
-          ceilingUsd: config.budgetUsd.jev,
-        });
-        expect(reservation, `Insufficient Jev budget for held-out example ${item.id}`).toBeTruthy();
         const evaluated = await classifier.evaluate({
           state,
           abortSignal: AbortSignal.timeout(TIMING.jevCallMs),
@@ -228,25 +260,6 @@ describe('F5 live evaluation prerequisites', () => {
         });
         const evaluatedInputTokens = evaluated.usage.inputTokens;
         const evaluatedOutputTokens = evaluated.usage.outputTokens;
-        if (
-          typeof evaluatedInputTokens === 'number' &&
-          typeof evaluatedOutputTokens === 'number' &&
-          Number.isSafeInteger(evaluatedInputTokens) &&
-          Number.isSafeInteger(evaluatedOutputTokens) &&
-          evaluatedInputTokens >= 0 &&
-          evaluatedOutputTokens >= 0
-        ) {
-          await monitorStore.settleProviderReservation({
-            id: reservation!,
-            knownAmountUnits: Math.ceil(
-              ((evaluatedInputTokens * PRICING_REFERENCE.jevInputUsdPerMillion +
-                evaluatedOutputTokens * PRICING_REFERENCE.jevOutputUsdPerMillion) /
-                PRICING_REFERENCE.tokensPerPricingUnit) *
-                CLASSIFICATION_LIMITS.usdReservationUnits,
-            ),
-            unresolvedUnits: 0,
-          });
-        }
         if (typeof evaluated.response.modelId === 'string' && evaluated.response.modelId) {
           reportedModels.add(evaluated.response.modelId);
         } else missingReportedModel = true;
@@ -274,7 +287,7 @@ describe('F5 live evaluation prerequisites', () => {
           choiceConfidence: (evaluated.providerMetadata as any)?.typesafe?.confidence?.change_type,
         });
       }
-      const accounting = await monitorStore.providerBudgetAccounting('jev');
+      const accounting = await new TestSpendingLedger(monitorStore.client).providerBudgetAccounting('jev');
       const report = reportEvaluation({
         datasetVersion: LIVE_EVALUATION_DATASET_VERSION,
         questionSetVersion: QUESTION_SET_VERSION,
@@ -296,7 +309,7 @@ describe('F5 live evaluation prerequisites', () => {
           },
           budget: {
             provider: 'jev',
-            ceilingUsd: Math.min(PROJECT_BUDGET_USD.jev, config.budgetUsd.jev),
+            ceilingUsd: PROJECT_BUDGET_USD.jev,
             reservedUsd: accounting.reservedUsd,
             knownUsd: accounting.knownUsd,
             unresolvedUsd: accounting.unresolvedUsd,
@@ -304,7 +317,7 @@ describe('F5 live evaluation prerequisites', () => {
         },
       });
       console.info(
-        'F5_LIVE_EVALUATION_REPORT',
+        'LIVE_EVALUATION_REPORT',
         JSON.stringify({
           datasetVersion: report.datasetVersion,
           questionSetVersion: report.questionSetVersion,

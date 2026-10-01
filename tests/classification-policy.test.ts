@@ -10,8 +10,8 @@ import { LibSQLStore } from '@mastra/libsql';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  CLASSIFIER_ID,
   COMPETITOR_CHANGE_QUESTIONS,
-  JEV_RESERVATION_USD,
   QUESTION_SET_VERSION,
   classificationAbortSignal,
   classificationState,
@@ -290,7 +290,6 @@ describe('auditable classifier policy', () => {
       MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
       TYPESAFE_AI_API_KEY: 'synthetic-key',
       JEV_MODEL: 'jev-fixture-v1',
-      JEV_COST_ATTESTATION: 'typesafe-jev-2026-09-27:jev-fixture-v1',
     });
     const store = MonitorStore.open(config.storage.monitorUrl);
     const first = `<main><h1>Pricing</h1><p>Starter costs $19.</p><p>Exports are available.</p><p>Support is standard.</p>${qualityFiller}</main>`;
@@ -327,6 +326,71 @@ describe('auditable classifier policy', () => {
     ).toMatchObject({ route: 'review', reason: 'COMPOUND_CHANGE' });
   });
 
+  it('preserves_baseline_pending_work_and_recovers_overflow_in_order', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'classification-limits-'));
+    const pendingConfig = loadConfig({
+      MONITOR_DATABASE_URL: `file:${join(directory, 'monitor.db')}`,
+      MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
+    });
+    const config = loadConfig({
+      MONITOR_DATABASE_URL: pendingConfig.storage.monitorUrl,
+      MASTRA_DATABASE_URL: pendingConfig.storage.mastraUrl,
+      TYPESAFE_AI_API_KEY: 'synthetic',
+    });
+    const store = MonitorStore.open(config.storage.monitorUrl);
+    const before = `<main><h1>Pricing</h1><p>Starter costs $19.</p><p>Exports are available.</p><p>Support is standard.</p>${qualityFiller}</main>`;
+    const after = `<main><h1>Pricing</h1><p>Starter costs $29.</p><p>Exports include SSO.</p><p>Support has changed.</p>${qualityFiller}</main>`;
+    const evaluated: string[] = [];
+    const classifier = () =>
+      new Classifier({
+        id: CLASSIFIER_ID,
+        model: fixtureModel(call => evaluated.push(call.state.evidence.after)),
+        questions: COMPETITOR_CHANGE_QUESTIONS,
+      });
+    const options = { generateSummary: false };
+    try {
+      await monitoredWorkflow(store, pendingConfig, () => before, classifier(), { options });
+      await monitoredWorkflow(store, pendingConfig, () => after, classifier(), { options });
+      const pending = await store.pendingCandidatesForSource('classification-monitor', 'pricing');
+      expect(pending).toHaveLength(3);
+      const baseline = await monitoredWorkflow(store, config, () => after, classifier(), {
+        runMode: 'baseline',
+        policy: { maxCandidatesPerSource: 1 },
+        options,
+      });
+      expect(baseline.changes).toEqual(
+        pending.map(candidate =>
+          expect.objectContaining({ id: candidate.candidateId, status: 'deferred', reason: 'BASELINE_MODE' }),
+        ),
+      );
+      expect(evaluated).toEqual([]);
+      expect(await store.pendingCandidatesForSource('classification-monitor', 'pricing')).toEqual(pending);
+
+      const limited = await monitoredWorkflow(store, config, () => after, classifier(), {
+        policy: { maxCandidatesPerSource: 1 },
+        options,
+      });
+      expect(limited).toMatchObject({
+        counts: { candidatesClassified: 1, candidatesDeferred: 2 },
+        changes: [
+          { id: pending[0]!.candidateId, status: 'classified' },
+          { id: pending[1]!.candidateId, status: 'deferred', reason: 'CANDIDATE_LIMIT' },
+          { id: pending[2]!.candidateId, status: 'deferred', reason: 'CANDIDATE_LIMIT' },
+        ],
+      });
+      expect(evaluated).toEqual([pending[0]!.afterText]);
+      expect(await store.pendingCandidatesForSource('classification-monitor', 'pricing')).toEqual(pending.slice(1));
+
+      const recovered = await monitoredWorkflow(store, config, () => after, classifier(), { options });
+      expect(recovered.counts).toMatchObject({ candidatesClassified: 2, candidatesDeferred: 0 });
+      expect(evaluated).toEqual(pending.map(candidate => candidate.afterText));
+      expect(await store.pendingCandidatesForSource('classification-monitor', 'pricing')).toEqual([]);
+      expect((await store.client.execute('SELECT candidate_id FROM classification_decisions')).rows).toHaveLength(3);
+    } finally {
+      await store.close();
+    }
+  });
+
   it('native_classifier_preserves_audit_metadata_and_unknown_usage', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'classification-audit-'));
     const config = loadConfig({
@@ -334,7 +398,6 @@ describe('auditable classifier policy', () => {
       MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
       TYPESAFE_AI_API_KEY: 'synthetic-key-CANARY-DO-NOT-EXPORT',
       JEV_MODEL: 'jev-fixture',
-      JEV_COST_ATTESTATION: 'typesafe-jev-2026-09-27:jev-fixture',
     });
     const store = MonitorStore.open(config.storage.monitorUrl);
     const observability = createLocalObservability();
@@ -456,7 +519,6 @@ describe('auditable classifier policy', () => {
       MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
       TYPESAFE_AI_API_KEY: 'synthetic',
       JEV_MODEL: 'jev-fixture',
-      JEV_COST_ATTESTATION: 'typesafe-jev-2026-09-27:jev-fixture',
     });
     const store = MonitorStore.open(config.storage.monitorUrl);
     const before = `<main><h1>Pricing</h1><p>Starter costs $19.</p><p>Exports are available.</p>${qualityFiller}</main>`;
@@ -524,7 +586,6 @@ describe('auditable classifier policy', () => {
       await evaluationStarted;
       await run.cancel();
       expect((await started).status).toBe('canceled');
-      expect(await store.reservedProviderUsd('jev')).toBe(Math.ceil(JEV_RESERVATION_USD * 1_000_000) / 1_000_000);
       expect(await store.pendingCandidatesForSource('classification-monitor', 'pricing')).toHaveLength(2);
       expect((await store.client.execute('SELECT * FROM monitor_locks')).rows).toHaveLength(0);
 
@@ -648,7 +709,6 @@ describe('auditable classifier policy', () => {
       MASTRA_DATABASE_URL: pendingConfig.storage.mastraUrl,
       TYPESAFE_AI_API_KEY: 'synthetic',
       JEV_MODEL: 'jev-fixture',
-      JEV_COST_ATTESTATION: 'typesafe-jev-2026-09-27:jev-fixture',
     });
     const store = MonitorStore.open(pendingConfig.storage.monitorUrl);
     const before = `<main><h1>Pricing</h1><p>Starter costs $19.</p>${qualityFiller}</main>`;
@@ -735,7 +795,6 @@ describe('auditable classifier policy', () => {
       MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
       TYPESAFE_AI_API_KEY: 'synthetic',
       JEV_MODEL: 'jev-fixture',
-      JEV_COST_ATTESTATION: 'typesafe-jev-2026-09-27:jev-fixture',
     });
     const before = `<main><h1>Pricing</h1><p>Starter costs $19.</p>${qualityFiller}</main>`;
     const after = `<main><h1>Pricing</h1><p>Starter costs $29.</p>${qualityFiller}</main>`;
@@ -787,7 +846,7 @@ describe('auditable classifier policy', () => {
       expect(recovered).toMatchObject({
         status: 'partial',
         counts: { candidatesClassified: 1 },
-        report: { summaryFailure: 'COST_UNVERIFIED' },
+        report: { summaryFailure: 'SUMMARY_NOT_CONFIGURED' },
       });
       expect(await reopened.pendingCandidatesForSource('classification-monitor', 'pricing')).toHaveLength(0);
       const repeated = await monitoredWorkflow(
@@ -814,7 +873,6 @@ describe('auditable classifier policy', () => {
       MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
       TYPESAFE_AI_API_KEY: 'synthetic',
       JEV_MODEL: 'jev-fixture',
-      JEV_COST_ATTESTATION: 'typesafe-jev-2026-09-27:jev-fixture',
     });
     const store = MonitorStore.open(config.storage.monitorUrl);
     const sources: MonitorInput['sources'] = [
@@ -867,7 +925,6 @@ describe('auditable classifier policy', () => {
   });
 
   it('bounds_acquisition_and_provider_failure', async () => {
-    expect(JEV_RESERVATION_USD).toBeGreaterThan(0);
     expect(() =>
       classificationState({
         evidence: { ...evidence, afterText: 'x'.repeat(24_001) },
@@ -896,6 +953,27 @@ describe('auditable classifier policy', () => {
     await expect(classifier.evaluate({ state: { candidate: 'x' }, maxRetries: 2 })).rejects.toThrow();
     expect(attempts).toBe(3);
   }, 15_000);
+
+  it('sends_selected_interest_meanings_and_operator_context_to_jev', () => {
+    const state = classificationState({
+      evidence,
+      source: { id: 'pricing', label: 'Plans', url: 'https://public.example/pricing', kind: 'pricing' },
+      interests: ['packaging', 'security_compliance'],
+      prioritySignals: ['enterprise plan'],
+      ignoredSignals: ['footer text'],
+      organizationContext: 'We sell to regulated companies.',
+    });
+    expect(state).toMatchObject({
+      interests: ['packaging', 'security_compliance'],
+      interestDefinitions: [
+        { interest: 'packaging', meaning: expect.stringContaining('entitlements') },
+        { interest: 'security_compliance', meaning: expect.stringContaining('certifications') },
+      ],
+      prioritySignals: ['enterprise plan'],
+      ignoredSignals: ['footer text'],
+      organizationContext: 'We sell to regulated companies.',
+    });
+  });
 
   it('native_classifier_rejects_invalid_results_and_honors_abort', async () => {
     let attempts = 0;
@@ -999,7 +1077,6 @@ describe('auditable classifier policy', () => {
       MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
       TYPESAFE_AI_API_KEY: 'synthetic',
       JEV_MODEL: 'jev-fixture',
-      JEV_COST_ATTESTATION: 'typesafe-jev-2026-09-27:jev-fixture',
     });
     const store = MonitorStore.open(config.storage.monitorUrl);
     const page = (changed: boolean) =>
@@ -1045,36 +1122,7 @@ describe('auditable classifier policy', () => {
     }
   });
 
-  it('jev_budget_survives_retries_restart_and_defers_remaining_changes', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'classification-budget-'));
-    const url = `file:${join(directory, 'monitor.db')}`;
-    let store = MonitorStore.open(url);
-    try {
-      const concurrent = await Promise.all(
-        ['one', 'two'].map(candidateId =>
-          store.reserveProviderBudget({
-            provider: 'jev',
-            candidateId,
-            amountUsd: JEV_RESERVATION_USD,
-            ceilingUsd: Math.ceil(JEV_RESERVATION_USD * 1_000_000) / 1_000_000,
-          }),
-        ),
-      );
-      expect(concurrent.filter(Boolean)).toHaveLength(1);
-      expect(await store.reservedProviderUsd('jev')).toBeLessThanOrEqual(
-        Math.ceil(JEV_RESERVATION_USD * 1_000_000) / 1_000_000,
-      );
-      await store.close();
-      store = MonitorStore.open(url);
-      expect(await store.reservedProviderUsd('jev')).toBeLessThanOrEqual(
-        Math.ceil(JEV_RESERVATION_USD * 1_000_000) / 1_000_000,
-      );
-    } finally {
-      await store.close();
-    }
-  });
-
-  it('jev_budget_survives_retries_restart_and_defers_remaining_changes_workflow', async () => {
+  it('classifies every candidate without project spending caps and avoids duplicates after restart', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'classification-budget-workflow-'));
     const url = `file:${join(directory, 'monitor.db')}`;
     const config = loadConfig({
@@ -1082,8 +1130,7 @@ describe('auditable classifier policy', () => {
       MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
       TYPESAFE_AI_API_KEY: 'synthetic',
       JEV_MODEL: 'jev-fixture',
-      JEV_COST_ATTESTATION: 'typesafe-jev-2026-09-27:jev-fixture',
-      JEV_BUDGET_USD: String(Math.ceil(JEV_RESERVATION_USD * 1_000_000) / 1_000_000),
+      JEV_BUDGET_USD: '0',
     });
     let store = MonitorStore.open(url);
     let calls = 0;
@@ -1096,22 +1143,26 @@ describe('auditable classifier policy', () => {
     const before = `<main><h1>Pricing</h1><p>Starter costs $19.</p><p>Exports are available.</p>${qualityFiller}</main>`;
     const after = `<main><h1>Pricing</h1><p>Starter costs $29.</p><p>Exports include SSO.</p>${qualityFiller}</main>`;
     try {
-      await monitoredWorkflow(store, config, () => before, classifier());
-      const partial = await monitoredWorkflow(store, config, () => after, classifier());
-      expect(partial).toMatchObject({ status: 'partial', counts: { candidatesClassified: 1, candidatesDeferred: 1 } });
-      expect(partial.changes).toEqual(
-        expect.arrayContaining([expect.objectContaining({ status: 'deferred', reason: 'BUDGET_EXHAUSTED' })]),
-      );
-      expect(calls).toBe(1);
+      await monitoredWorkflow(store, config, () => before, classifier(), { options: { generateSummary: false } });
+      const classified = await monitoredWorkflow(store, config, () => after, classifier(), {
+        options: { generateSummary: false },
+      });
+      expect(classified).toMatchObject({
+        status: 'success',
+        counts: { candidatesClassified: 2, candidatesDeferred: 0 },
+      });
+      expect(calls).toBe(2);
       await store.close();
       store = MonitorStore.open(url);
-      const recovered = await monitoredWorkflow(store, config, () => after, classifier());
-      expect(recovered).toMatchObject({
-        status: 'partial',
-        counts: { candidatesClassified: 0, candidatesDeferred: 1 },
+      const recovered = await monitoredWorkflow(store, config, () => after, classifier(), {
+        options: { generateSummary: false },
       });
-      expect(calls).toBe(1);
-      expect((await store.client.execute('SELECT candidate_id FROM classification_decisions')).rows).toHaveLength(1);
+      expect(recovered).toMatchObject({
+        status: 'no_change',
+        counts: { candidatesClassified: 0, candidatesDeferred: 0 },
+      });
+      expect(calls).toBe(2);
+      expect((await store.client.execute('SELECT candidate_id FROM classification_decisions')).rows).toHaveLength(2);
     } finally {
       await store.close();
     }

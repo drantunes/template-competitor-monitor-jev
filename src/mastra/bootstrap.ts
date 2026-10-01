@@ -1,10 +1,13 @@
 import { SimpleAuth } from '@mastra/core/server';
 import { LibSQLStore } from '@mastra/libsql';
 
-import { loadConfig } from './config';
+import { CHAT_DEFAULTS, loadConfig } from './config';
+import { dailyMonitorSchedules, scheduledMonitorInputs } from './config/scheduled-monitors';
+import { createCompetitorMonitorAgent } from './monitor-agent';
 import { createLocalObservability } from './lib/observability';
 import { createReportSummaryAgent } from './lib/reporting';
 import { ensureDatabaseDirectory, MonitorStore } from './lib/store';
+import { createNotificationProviders } from './notifications';
 import { createCompetitorMonitorWorkflow } from './workflows/competitor-monitor-workflow';
 
 /** Initialize one runtime's configuration and local dependencies without making provider calls. */
@@ -12,11 +15,24 @@ export function initializeRuntime(environment: Readonly<Record<string, string | 
   const config = loadConfig(environment);
   ensureDatabaseDirectory(config.storage.mastraUrl);
   const applicationStore = MonitorStore.open(config.storage.monitorUrl);
-  const summaryAgent =
-    config.credentials.openaiApiKey && config.billing.openaiCostAttested
-      ? createReportSummaryAgent(config.credentials.openaiApiKey)
-      : undefined;
-  const workflow = createCompetitorMonitorWorkflow({ store: applicationStore, config, summaryAgent });
+  const summaryAgent = config.credentials.openaiApiKey
+    ? createReportSummaryAgent(config.credentials.openaiApiKey)
+    : undefined;
+  const workflow = createCompetitorMonitorWorkflow(
+    {
+      store: applicationStore,
+      config,
+      summaryAgent,
+      notificationProviders: createNotificationProviders(config.storage.reportsDir),
+    },
+    dailyMonitorSchedules(scheduledMonitorInputs(config.schedule, config.sources.maxSources)),
+  );
+  const monitorAgent = config.credentials.openaiApiKey
+    ? createCompetitorMonitorAgent(workflow, {
+        id: CHAT_DEFAULTS.model,
+        apiKey: config.credentials.openaiApiKey,
+      })
+    : undefined;
   const frameworkStore = new LibSQLStore({ id: 'competitor-monitor-framework', url: config.storage.mastraUrl });
   return {
     config,
@@ -24,6 +40,7 @@ export function initializeRuntime(environment: Readonly<Record<string, string | 
     frameworkStore,
     workflow,
     summaryAgent,
+    monitorAgent,
     observability: createLocalObservability(),
     server:
       config.executionMode === 'production'

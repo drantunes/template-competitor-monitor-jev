@@ -38,6 +38,4 @@ export function resolveStorageRoot(environment: Readonly<Record<string, string |
 export const OVERRIDE_BOUNDS = {
   // Smallest usable count for source/candidate work; fixed integer lower bound.
   minCount: 1,
-  // USD; zero explicitly disables paid work, negative budgets are invalid.
-  minBudgetUsd: 0,
 } as const;

@@ -1,6 +1,7 @@
 import { z } from 'zod';
+import { resolve } from 'node:path';
 
-import { JEV_ACCESS, PROJECT_BUDGET_USD } from './jev-config';
+import { JEV_ACCESS } from './jev-config';
 import { MODEL_DEFAULTS } from './model-defaults-config';
 import {
   OVERRIDE_BOUNDS,
@@ -32,9 +33,10 @@ function numericEnvironmentValue(fallback: number, min: number, max: number, int
 const environmentSchema = z
   .object({
     EXECUTION_MODE: z.enum(['local', 'production']).default(SERVER_DEFAULTS.executionMode),
+    ENABLE_MONITOR_SCHEDULER: z.enum(['true', 'false']).default('false'),
     MASTRA_API_TOKEN: z.string().optional(),
     MAX_SOURCES: numericEnvironmentValue(
-      SOURCE_LIMITS.maxSources,
+      SOURCE_LIMITS.defaultMaxSources,
       OVERRIDE_BOUNDS.minCount,
       SOURCE_LIMITS.maxSources,
       true,
@@ -51,25 +53,11 @@ const environmentSchema = z
       SOURCE_LIMITS.maxCandidatesPerSource,
       true,
     ),
-    JEV_BUDGET_USD: numericEnvironmentValue(
-      PROJECT_BUDGET_USD.jev,
-      OVERRIDE_BOUNDS.minBudgetUsd,
-      PROJECT_BUDGET_USD.jev,
-    ),
-    OPENAI_BUDGET_USD: numericEnvironmentValue(
-      PROJECT_BUDGET_USD.openai,
-      OVERRIDE_BOUNDS.minBudgetUsd,
-      PROJECT_BUDGET_USD.openai,
-    ),
     JEV_MODEL: z.string().trim().min(1).default(MODEL_DEFAULTS.jev),
     JEV_ACCESS_MODE: z.enum([JEV_ACCESS.direct, JEV_ACCESS.vercelGateway]).default(JEV_ACCESS.direct),
     TYPESAFE_AI_API_KEY: z.string().trim().min(1).optional(),
     AI_GATEWAY_API_KEY: z.string().trim().min(1).optional(),
-    // Operator confirms this exact configured model/account uses the published bounded Jev tariff before a paid call.
-    JEV_COST_ATTESTATION: z.string().trim().min(1).optional(),
     OPENAI_API_KEY: z.string().trim().min(1).optional(),
-    // The operator verifies model access and the current published tariff before an OpenAI request.
-    OPENAI_COST_ATTESTATION: z.string().trim().min(1).optional(),
     MASTRA_DATABASE_URL: z.string().trim().min(1).default(STORAGE_DEFAULTS.mastraUrl),
     MONITOR_DATABASE_URL: z.string().trim().min(1).default(STORAGE_DEFAULTS.monitorUrl),
     MASTRA_PROJECT_ROOT: z.string().trim().min(1).optional(),
@@ -104,6 +92,10 @@ export function loadConfig(environment: Readonly<Record<string, string | undefin
   const projectRoot = resolveStorageRoot(environment, env.MASTRA_PROJECT_ROOT);
   return {
     executionMode: env.EXECUTION_MODE,
+    schedule: {
+      enabled: env.ENABLE_MONITOR_SCHEDULER === 'true',
+      file: resolve(projectRoot, 'scheduled-monitors.json'),
+    },
     // Never log or persist this object: it contains the server credential.
     server: {
       host: env.EXECUTION_MODE === 'local' ? SERVER_DEFAULTS.localHost : SERVER_DEFAULTS.productionHost,
@@ -123,18 +115,10 @@ export function loadConfig(environment: Readonly<Record<string, string | undefin
       jevApiKey: gateway ? env.AI_GATEWAY_API_KEY : env.TYPESAFE_AI_API_KEY,
       openaiApiKey: env.OPENAI_API_KEY,
     },
-    billing: {
-      jevCostAttested:
-        env.JEV_COST_ATTESTATION ===
-        (gateway
-          ? `vercel-ai-gateway-typesafe-2026-09-29:${JEV_ACCESS.vercelGatewayModel}`
-          : `typesafe-jev-2026-09-27:${jevModel}`),
-      openaiCostAttested: env.OPENAI_COST_ATTESTATION === `openai-gpt-6-luna-2026-09-29:${MODEL_DEFAULTS.summary}`,
-    },
-    budgetUsd: { jev: env.JEV_BUDGET_USD, openai: env.OPENAI_BUDGET_USD },
     storage: {
       mastraUrl: resolveDatabaseUrl(env.MASTRA_DATABASE_URL, projectRoot),
       monitorUrl: resolveDatabaseUrl(env.MONITOR_DATABASE_URL, projectRoot),
+      reportsDir: resolve(projectRoot, '.data/reports'),
     },
   };
 }

@@ -21,69 +21,59 @@ export function createClassifyPendingStep(context: StepContext) {
     inputSchema: z.array(sourceProcessedSchema),
     outputSchema: classifiedSourcesSchema,
     execute: async ({ inputData, getInitData, mastra, abortSignal }) => {
-      const input = getInitData() as MonitorInput;
+      const input = getInitData<MonitorInput>();
       const sourceById = new Map(input.sources.map(source => [source.id, source]));
       const changes: MonitorRunResult['changes'] = [];
+      const maximum = input.policy.maxCandidatesPerSource ?? dependencies.config.sources.candidatesPerSource;
       let classifier: Classifier<typeof COMPETITOR_CHANGE_QUESTIONS> | undefined;
+      const getClassifier = () => {
+        classifier ??= mastra.getClassifierById(CLASSIFIER_ID) as
+          Classifier<typeof COMPETITOR_CHANGE_QUESTIONS> | undefined;
+        return classifier;
+      };
+      const stopForCancellation = async (processed: (typeof inputData)[number]) => {
+        await finishCanceledRun(processed.runId, processed.monitorId);
+        return { processed: inputData, changes };
+      };
+
       for (const processed of inputData) {
-        const stopForCancellation = async () => {
-          await finishCanceledRun(processed.runId, processed.monitorId);
-          return { processed: inputData, changes };
-        };
-        if (abortSignal.aborted) return stopForCancellation();
+        if (abortSignal.aborted) return stopForCancellation(processed);
         const source = sourceById.get(processed.sourceId);
         if (!source) continue;
         const candidates = await dependencies.store.pendingCandidatesForSource(input.monitorId, source.id);
-        if (processed.source.error?.code === 'SOURCE_ID_REBOUND') {
-          changes.push(
-            ...candidates.map(candidate => ({
+        const sourceDeferredReason =
+          processed.source.error?.code === 'SOURCE_ID_REBOUND'
+            ? 'SOURCE_ID_REBOUND'
+            : input.runMode === 'baseline'
+              ? 'BASELINE_MODE'
+              : undefined;
+
+        for (const [index, candidate] of candidates.entries()) {
+          if (abortSignal.aborted) return stopForCancellation(processed);
+          const deferredReason = sourceDeferredReason ?? (index >= maximum ? 'CANDIDATE_LIMIT' : undefined);
+          if (deferredReason) {
+            changes.push({
               id: candidate.candidateId,
               sourceId: source.id,
-              status: 'deferred' as const,
-              reason: 'SOURCE_ID_REBOUND',
-            })),
-          );
-          continue;
-        }
-        if (input.runMode === 'baseline') {
-          changes.push(
-            ...candidates.map(candidate => ({
-              id: candidate.candidateId,
-              sourceId: source.id,
-              status: 'deferred' as const,
-              reason: 'BASELINE_MODE',
-            })),
-          );
-          continue;
-        }
-        const maximum = input.policy.maxCandidatesPerSource ?? dependencies.config.sources.candidatesPerSource;
-        for (const candidate of candidates.slice(maximum)) {
-          changes.push({
-            id: candidate.candidateId,
-            sourceId: source.id,
-            status: 'deferred',
-            reason: 'CANDIDATE_LIMIT',
-          });
-        }
-        for (const candidate of candidates.slice(0, maximum)) {
-          if (abortSignal.aborted) return stopForCancellation();
+              status: 'deferred',
+              reason: deferredReason,
+            });
+            continue;
+          }
           try {
             const outcome = await classifyCandidate({
               candidate,
               source,
               input,
               dependencies,
-              getClassifier: () => {
-                classifier ??= mastra.getClassifierById(CLASSIFIER_ID) as
-                  Classifier<typeof COMPETITOR_CHANGE_QUESTIONS> | undefined;
-                return classifier;
-              },
+              getClassifier,
               abortSignal,
+              runId: processed.runId,
             });
-            if (!outcome) return stopForCancellation();
+            if (!outcome) return stopForCancellation(processed);
             changes.push(outcome);
           } catch (error) {
-            if (abortSignal.aborted) return stopForCancellation();
+            if (abortSignal.aborted) return stopForCancellation(processed);
             const reason =
               error instanceof Error && error.message === 'CANDIDATE_STATE_LIMIT'
                 ? 'CANDIDATE_STATE_LIMIT'

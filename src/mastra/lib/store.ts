@@ -1,13 +1,14 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createClient, type Client } from '@libsql/client';
 
-import { CLASSIFICATION_LIMITS, resolveDatabaseUrl } from '../config';
+import { resolveDatabaseUrl } from '../config';
 import type { ClassificationDecision } from './classification';
 import type { Evidence, NormalizedContent } from './content';
+import type { ChangeNotification } from '../notifications/types';
 
 /** Prepare local directories only; remote and in-memory URLs do not touch the filesystem. */
 export function ensureDatabaseDirectory(url: string) {
@@ -158,18 +159,19 @@ export class MonitorStore {
         created_at TEXT NOT NULL,
         PRIMARY KEY (candidate_id, question_set_version, rule_version)
       );
-      CREATE TABLE IF NOT EXISTS provider_reservations (
+      CREATE TABLE IF NOT EXISTS notification_events (
         id TEXT PRIMARY KEY,
-        provider TEXT NOT NULL,
-        candidate_id TEXT NOT NULL,
-        amount_units INTEGER NOT NULL,
-        known_amount_units INTEGER,
-        unresolved_units INTEGER NOT NULL,
-        status TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        monitor_id TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS notification_receipts (
+        event_id TEXT NOT NULL REFERENCES notification_events(id),
+        provider_id TEXT NOT NULL,
+        delivered_at TEXT,
+        PRIMARY KEY (event_id, provider_id)
       );
     `);
-    // Older F1 databases store only normalized content. Keep those immutable rows readable and add
+    // Older databases store only normalized content. Keep those immutable rows readable and add
     // optional metadata for new snapshots instead of rebuilding or rewriting the table.
     const snapshotColumns = await this.client.execute('PRAGMA table_info(snapshots)');
     if (!snapshotColumns.rows.some(row => String(row.name) === 'acquisition_json')) {
@@ -266,6 +268,17 @@ export class MonitorStore {
           result: row.result_json ? JSON.parse(String(row.result_json)) : undefined,
         }
       : undefined;
+  }
+
+  /** Native lifecycle cleanup is idempotent and cannot release another run's lock. */
+  async finishInterruptedNativeRun(nativeWorkflowRunId: string, status: 'partial' | 'failed', code: string) {
+    const run = await this.runForNativeWorkflowRunId(nativeWorkflowRunId);
+    if (!run || run.status !== 'running') return;
+    await this.finishRun(
+      { id: run.runId, monitorId: run.monitorId, status: 'running', startedAt: run.startedAt },
+      status,
+      { code },
+    );
   }
 
   async baseline(monitorId: string, sourceId: string) {
@@ -465,6 +478,16 @@ export class MonitorStore {
     return result.rows.map(row => JSON.parse(String(row.evidence_json)) as Evidence);
   }
 
+  /** Candidate identities first detected by this run, including candidates classified later. */
+  async candidateIdsForRun(runId: string) {
+    await this.init();
+    const result = await this.client.execute({
+      sql: 'SELECT id FROM pending_evidence WHERE run_id = ?',
+      args: [runId],
+    });
+    return result.rows.map(row => String(row.id));
+  }
+
   async evidence(candidateId: string) {
     const result = await this.client.execute({
       sql: `SELECT p.evidence_json, s.source_url FROM pending_evidence p
@@ -502,96 +525,52 @@ export class MonitorStore {
     }));
   }
 
-  /** Atomically reserves the full bounded native-call allowance. Reservations remain on uncertain billing. */
-  async reserveProviderBudget(input: {
-    provider: 'jev' | 'openai';
-    candidateId: string;
-    amountUsd: number;
-    ceilingUsd: number;
-  }) {
-    await this.init();
-    const id = randomUUID();
-    const amountUnits = Math.ceil(input.amountUsd * CLASSIFICATION_LIMITS.usdReservationUnits);
-    const ceilingUnits = Math.floor(input.ceilingUsd * CLASSIFICATION_LIMITS.usdReservationUnits);
-    const result = await this.client.execute({
-      sql: `INSERT INTO provider_reservations (id, provider, candidate_id, amount_units, unresolved_units, status, created_at)
-            SELECT ?, ?, ?, ?, ?, 'uncertain', ?
-            WHERE COALESCE((SELECT SUM(COALESCE(known_amount_units + unresolved_units, amount_units)) FROM provider_reservations WHERE provider = ?), 0) + ? <= ?`,
-      args: [
-        id,
-        input.provider,
-        input.candidateId,
-        amountUnits,
-        amountUnits,
-        new Date().toISOString(),
-        input.provider,
-        amountUnits,
-        ceilingUnits,
-      ],
-    });
-    return result.rowsAffected > 0 ? id : undefined;
-  }
-
-  /** Release only a reservation made before an evaluation was dispatched. Attempted calls remain uncertain. */
-  async releaseUnattemptedProviderReservation(id: string) {
-    await this.client.execute({
-      sql: `DELETE FROM provider_reservations
-            WHERE id = ? AND status = 'uncertain' AND known_amount_units IS NULL AND unresolved_units = amount_units`,
-      args: [id],
-    });
-  }
-
-  /** Record completed provider usage only when all billed components are known within the original reservation. */
-  async settleProviderReservation(input: { id: string; knownAmountUnits: number; unresolvedUnits: number }) {
-    await this.init();
-    if (
-      !Number.isSafeInteger(input.knownAmountUnits) ||
-      !Number.isSafeInteger(input.unresolvedUnits) ||
-      input.knownAmountUnits < 0 ||
-      input.unresolvedUnits < 0
-    ) {
-      throw new Error('INVALID_PROVIDER_RESERVATION_SETTLEMENT');
-    }
-    const result = await this.client.execute({
-      sql: `UPDATE provider_reservations
-            SET known_amount_units = ?, unresolved_units = ?, status = CASE WHEN ? = 0 THEN 'settled' ELSE 'uncertain' END
-            WHERE id = ? AND status = 'uncertain' AND known_amount_units IS NULL AND unresolved_units = amount_units
-              AND ? + ? <= amount_units`,
-      args: [
-        input.knownAmountUnits,
-        input.unresolvedUnits,
-        input.unresolvedUnits,
-        input.id,
-        input.knownAmountUnits,
-        input.unresolvedUnits,
-      ],
-    });
-    return result.rowsAffected > 0;
-  }
-
   async commitClassification(input: {
     candidateId: string;
     questionSetVersion: string;
     decision: ClassificationDecision;
     audit: Record<string, unknown>;
-    reservationId?: string;
-    knownUsageUsd?: number;
-    unresolvedUsageUsd?: number;
+    notification?: { runId: string; monitorId: string; monitorName: string; sourceId: string; providerIds: string[] };
   }) {
     await this.init();
-    const settlement =
-      input.reservationId && input.knownUsageUsd !== undefined && input.unresolvedUsageUsd !== undefined
-        ? [
-            {
-              sql: 'UPDATE provider_reservations SET known_amount_units = ?, unresolved_units = ? WHERE id = ?',
-              args: [
-                Math.ceil(input.knownUsageUsd * CLASSIFICATION_LIMITS.usdReservationUnits),
-                Math.ceil(input.unresolvedUsageUsd * CLASSIFICATION_LIMITS.usdReservationUnits),
-                input.reservationId,
-              ],
-            },
-          ]
-        : [];
+    const date = new Date().toISOString();
+    const eventId = createHash('sha256')
+      .update(JSON.stringify([input.candidateId, input.questionSetVersion, input.decision.ruleVersion]))
+      .digest('hex');
+    const evidence = input.notification ? await this.evidence(input.candidateId) : undefined;
+    const event: ChangeNotification | undefined =
+      input.notification && evidence
+        ? {
+            eventId,
+            runId: input.notification.runId,
+            monitorId: input.notification.monitorId,
+            monitorName: input.notification.monitorName,
+            date,
+            changes: [
+              {
+                id: input.candidateId,
+                sourceId: input.notification.sourceId,
+                status: 'classified',
+                route: input.decision.route,
+                evidence: {
+                  sourceUrl: evidence.sourceUrl,
+                  beforeExcerpt: evidence.evidence.beforeExcerpt,
+                  afterExcerpt: evidence.evidence.afterExcerpt,
+                },
+                provenance: {
+                  questionSetVersion: input.questionSetVersion,
+                  ruleVersion: input.decision.ruleVersion,
+                  model: {
+                    requested: typeof input.audit.requestedModel === 'string' ? input.audit.requestedModel : null,
+                    reported: typeof input.audit.reportedModel === 'string' ? input.audit.reportedModel : null,
+                    verified: typeof input.audit.verifiedModel === 'string' ? input.audit.verifiedModel : null,
+                  },
+                },
+              },
+            ],
+          }
+        : undefined;
+    if (input.notification && !event) throw new Error('NOTIFICATION_EVIDENCE_MISSING');
     await this.client.batch(
       [
         {
@@ -604,14 +583,45 @@ export class MonitorStore {
             input.decision.ruleVersion,
             JSON.stringify(input.decision),
             JSON.stringify(input.audit),
-            new Date().toISOString(),
+            date,
           ],
         },
+        ...(event
+          ? [
+              {
+                sql: `INSERT OR IGNORE INTO notification_events (id, monitor_id, payload_json)
+                SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM pending_evidence WHERE id = ? AND status = 'pending')`,
+                args: [eventId, event.monitorId, JSON.stringify(event), input.candidateId],
+              },
+              ...[...new Set(input.notification!.providerIds)].map(providerId => ({
+                sql: `INSERT OR IGNORE INTO notification_receipts (event_id, provider_id)
+                SELECT ?, ? WHERE EXISTS (SELECT 1 FROM notification_events WHERE id = ?)`,
+                args: [eventId, providerId, eventId],
+              })),
+            ]
+          : []),
         { sql: "UPDATE pending_evidence SET status = 'classified' WHERE id = ?", args: [input.candidateId] },
-        ...settlement,
       ],
       'write',
     );
+  }
+
+  /** Pending deliveries keep their original payload and enabled destination identities across restarts. */
+  async pendingNotifications(monitorId: string, providerId: string): Promise<ChangeNotification[]> {
+    await this.init();
+    const result = await this.client.execute({
+      sql: `SELECT e.payload_json FROM notification_events e JOIN notification_receipts r ON r.event_id = e.id
+            WHERE e.monitor_id = ? AND r.provider_id = ? AND r.delivered_at IS NULL ORDER BY e.id`,
+      args: [monitorId, providerId],
+    });
+    return result.rows.map(row => JSON.parse(String(row.payload_json)) as ChangeNotification);
+  }
+
+  async acknowledgeNotification(eventId: string, providerId: string) {
+    await this.client.execute({
+      sql: 'UPDATE notification_receipts SET delivered_at = ? WHERE event_id = ? AND provider_id = ? AND delivered_at IS NULL',
+      args: [new Date().toISOString(), eventId, providerId],
+    });
   }
 
   async classification(candidateId: string) {
@@ -629,26 +639,6 @@ export class MonitorStore {
           audit: JSON.parse(String(row.audit_json)) as Record<string, unknown>,
         } satisfies StoredClassification)
       : undefined;
-  }
-
-  async reservedProviderUsd(provider: 'jev' | 'openai') {
-    const result = await this.client.execute({
-      sql: 'SELECT COALESCE(SUM(COALESCE(known_amount_units + unresolved_units, amount_units)), 0) AS amount FROM provider_reservations WHERE provider = ?',
-      args: [provider],
-    });
-    return Number(result.rows[0]?.amount ?? 0) / CLASSIFICATION_LIMITS.usdReservationUnits;
-  }
-
-  /** Durable provider totals distinguish reconciled spend from attempts whose billing remains unknown. */
-  async providerBudgetAccounting(provider: 'jev' | 'openai') {
-    const result = await this.client.execute({
-      sql: `SELECT COALESCE(SUM(known_amount_units), 0) AS known, COALESCE(SUM(unresolved_units), 0) AS unresolved
-            FROM provider_reservations WHERE provider = ?`,
-      args: [provider],
-    });
-    const knownUsd = Number(result.rows[0]?.known ?? 0) / CLASSIFICATION_LIMITS.usdReservationUnits;
-    const unresolvedUsd = Number(result.rows[0]?.unresolved ?? 0) / CLASSIFICATION_LIMITS.usdReservationUnits;
-    return { knownUsd, unresolvedUsd, reservedUsd: knownUsd + unresolvedUsd };
   }
 
   async pendingWarningsForSource(monitorId: string, sourceId: string): Promise<string[]> {

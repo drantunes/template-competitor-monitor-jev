@@ -1,16 +1,19 @@
+import { createHash } from 'node:crypto';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { Classifier } from '@mastra/core/classifier';
 import { Mastra } from '@mastra/core/mastra';
 import { createScorer } from '@mastra/core/evals';
 import { LibSQLStore } from '@mastra/libsql';
 import { expectEvals } from '@mastra/evals/vitest';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
 import { loadConfig } from '../src/mastra/config';
 import type { DnsResolver, PinnedTransport } from '../src/mastra/lib/acquisition';
+import { CLASSIFIER_ID, COMPETITOR_CHANGE_QUESTIONS } from '../src/mastra/lib/classification';
 import { diffContent, normalizeHtml } from '../src/mastra/lib/content';
 import { MonitorStore } from '../src/mastra/lib/store';
 import { monitorInputSchema } from '../src/mastra/schemas';
@@ -47,6 +50,7 @@ async function startRegisteredWorkflow(
   input: unknown = sourceInput(),
   transport: PinnedTransport = fixtureTransport(page),
   resolver: DnsResolver = publicDns,
+  classifier?: Classifier<any>,
 ) {
   const workflow = createCompetitorMonitorWorkflow({
     store,
@@ -58,6 +62,7 @@ async function startRegisteredWorkflow(
   const mastra = new Mastra({
     storage: frameworkStore,
     workflows: { competitorMonitor: workflow },
+    classifiers: classifier ? { competitorChange: classifier } : undefined,
   });
   try {
     const run = await mastra.getWorkflow('competitorMonitor').createRun();
@@ -74,8 +79,9 @@ async function runRegisteredWorkflow(
   input: unknown = sourceInput(),
   transport: PinnedTransport = fixtureTransport(page),
   resolver: DnsResolver = publicDns,
+  classifier?: Classifier<any>,
 ) {
-  const result = await startRegisteredWorkflow(store, config, page, input, transport, resolver);
+  const result = await startRegisteredWorkflow(store, config, page, input, transport, resolver, classifier);
   if (result.status !== 'success') throw new Error('REGISTERED_WORKFLOW_FAILED');
   return result.result;
 }
@@ -100,6 +106,67 @@ async function sourceOutcome(store: MonitorStore, runId: string) {
 }
 
 describe('native workflow and durable application store', () => {
+  it('fatal_workflow_failure_releases_owned_lock_and_allows_retry', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'competitor-monitor-fatal-'));
+    const config = loadConfig({
+      MONITOR_DATABASE_URL: `file:${join(directory, 'monitor.db')}`,
+      MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
+    });
+    const store = MonitorStore.open(config.storage.monitorUrl);
+    stores.push(store);
+    await runRegisteredWorkflow(store, config, () => html('$19'));
+    await runRegisteredWorkflow(store, config, () => html('$29'));
+    const pending = await store.pendingCandidatesForSource('monitor-a', 'pricing-page');
+    expect(pending).toHaveLength(1);
+    const other = await store.beginRun('other-monitor', 'other-native-run');
+    const pendingRead = vi
+      .spyOn(store, 'pendingCandidatesForSource')
+      .mockRejectedValueOnce(new Error('TRANSIENT_STORE_READ'));
+    const cleanup = vi
+      .spyOn(store, 'finishInterruptedNativeRun')
+      .mockRejectedValueOnce(new Error('TRANSIENT_CLEANUP_FAILURE'));
+    const failed = await startRegisteredWorkflow(store, config, () => html('$29'));
+    expect(cleanup).toHaveBeenCalledTimes(2);
+    cleanup.mockRestore();
+    expect(failed.status).toBe('failed');
+    expect(JSON.stringify(failed)).toContain('TRANSIENT_STORE_READ');
+    pendingRead.mockRestore();
+    const rows = await store.client.execute(
+      "SELECT status FROM monitor_runs WHERE monitor_id = 'monitor-a' ORDER BY started_at DESC LIMIT 1",
+    );
+    expect(rows.rows[0]?.status).toBe('failed');
+    expect(
+      (await store.client.execute("SELECT * FROM monitor_locks WHERE monitor_id = 'monitor-a'")).rows,
+    ).toHaveLength(0);
+    expect((await store.pendingCandidatesForSource('monitor-a', 'pricing-page')).map(item => item.candidateId)).toEqual(
+      pending.map(item => item.candidateId),
+    );
+    await expect(store.beginRun('other-monitor')).rejects.toThrow('MONITOR_BUSY');
+    const invalid = await startRegisteredWorkflow(store, config, () => html('$29'), {
+      ...sourceInput(),
+      monitorId: 'other-monitor',
+      sources: [sourceInput().sources[0], sourceInput().sources[0]],
+    });
+    expect(invalid.status).toBe('failed');
+    expect(JSON.stringify(invalid)).toContain('DUPLICATE_SOURCE_ID');
+    const busy = await startRegisteredWorkflow(store, config, () => html('$29'), {
+      ...sourceInput(),
+      monitorId: 'other-monitor',
+    });
+    expect(busy.status).toBe('failed');
+    expect(JSON.stringify(busy)).toContain('MONITOR_BUSY');
+    await expect(store.beginRun('other-monitor')).rejects.toThrow('MONITOR_BUSY');
+    const healthy = await runRegisteredWorkflow(store, config, () => html('$29'));
+    expect(healthy.status).toBe('partial');
+    await store.finishInterruptedNativeRun('other-native-run', 'failed', 'TEST_CLEANUP');
+    // A repeated old callback must leave the new owner untouched.
+    const replacement = await store.beginRun('other-monitor', 'replacement-native-run');
+    await store.finishInterruptedNativeRun('other-native-run', 'failed', 'TEST_REPLAY');
+    await expect(store.beginRun('other-monitor')).rejects.toThrow('MONITOR_BUSY');
+    await store.finishRun(replacement, 'success', {});
+    expect((await store.runForNativeWorkflowRunId('other-native-run'))?.runId).toBe(other.id);
+  });
+
   it('retains every overflow candidate and its warning through native workflow restart', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'competitor-monitor-overflow-'));
     const config = loadConfig({
@@ -223,6 +290,140 @@ describe('native workflow and durable application store', () => {
     ]);
   });
 
+  it('renamed_normalization_preserves_history_and_detects_real_changes', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'competitor-monitor-history-'));
+    const config = loadConfig({
+      MONITOR_DATABASE_URL: `file:${join(directory, 'monitor.db')}`,
+      MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
+      TYPESAFE_AI_API_KEY: 'synthetic-test-only',
+    });
+    const input = monitorInputSchema.parse({ ...sourceInput(), options: { includeUnchangedSources: true } });
+    const source = input.sources[0]!;
+    const version = 'x9-semantic-v2';
+    const oldHash = (text: string) => createHash('sha256').update(`${version}\n${text}`).digest('hex');
+    const normalized = normalizeHtml(html('$19'), source);
+    const historical = {
+      ...normalized,
+      hash: oldHash(normalized.text),
+      sections: normalized.sections.map(section => ({ ...section, hash: oldHash(section.text) })),
+    };
+    const profile = JSON.stringify({
+      version,
+      contentSelector: source.contentSelector,
+      ignoreSelectors: source.ignoreSelectors,
+      minContentChars: source.minContentChars,
+    });
+    let store = MonitorStore.open(config.storage.monitorUrl);
+    stores.push(store);
+    const seed = await store.beginRun(input.monitorId);
+    const baseline = await store.persistAcceptedSnapshot({
+      runId: seed.id,
+      monitorId: input.monitorId,
+      sourceId: source.id,
+      sourceUrl: source.url,
+      normalizationProfile: profile,
+      content: historical,
+      evidence: [],
+      promoteBaseline: true,
+    });
+    await store.finishRun(seed, 'success', {});
+    const originalRow = (
+      await store.client.execute({ sql: 'SELECT * FROM snapshots WHERE id = ?', args: [baseline.id] })
+    ).rows[0];
+    await store.close();
+    stores = stores.filter(candidate => candidate !== store);
+    store = MonitorStore.open(config.storage.monitorUrl);
+    stores.push(store);
+    const evaluate = vi.fn(async () => {
+      throw new Error('TEST_MODEL_UNAVAILABLE');
+    });
+    const classifier = new Classifier({
+      id: CLASSIFIER_ID,
+      questions: COMPETITOR_CHANGE_QUESTIONS,
+      model: {
+        specificationVersion: 'v4',
+        provider: 'test.typesafe',
+        modelId: 'test-history',
+        supportedQuestionTypes: ['choice', 'score', 'boolean'],
+        doEvaluate: evaluate,
+      } as any,
+    });
+    const runPage = (price: string, selectedInput: unknown = input) =>
+      runRegisteredWorkflow(
+        store,
+        config,
+        () => html(price),
+        selectedInput,
+        fixtureTransport(() => html(price)),
+        publicDns,
+        classifier,
+      );
+    for (let repeat = 0; repeat < 2; repeat += 1) {
+      const unchanged = await runPage('$19');
+      expect(unchanged.sources).toEqual([expect.objectContaining({ status: 'unchanged' })]);
+      expect((await persistedCounts(store)).snapshots).toBe(1);
+      expect(await store.pendingCandidatesForSource(input.monitorId, source.id)).toHaveLength(0);
+      expect(evaluate).not.toHaveBeenCalled();
+    }
+    const changed = await runPage('$29');
+    expect(changed.sources).toEqual([expect.objectContaining({ status: 'changed' })]);
+    const pending = await store.pendingCandidatesForSource(input.monitorId, source.id);
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({
+      beforeSnapshotId: baseline.id,
+      beforeText: normalized.sections[1]!.text,
+      afterText: normalizeHtml(html('$29'), source).sections[1]!.text,
+      sectionKey: normalized.sections[1]!.key,
+    });
+    expect(evaluate).toHaveBeenCalled();
+    expect((await persistedCounts(store)).snapshots).toBe(2);
+    // The source retains its original profile even after a current-format baseline is promoted.
+    expect((await store.sourceIdentity(input.monitorId, source.id))?.profile).toBe(profile);
+    const repeat = await runPage('$29', { ...input, runMode: 'baseline' });
+    expect(repeat.sources).toEqual([expect.objectContaining({ status: 'unchanged' })]);
+    expect((await persistedCounts(store)).snapshots).toBe(2);
+    const compareCurrent = await runPage('$29');
+    expect(compareCurrent.sources).toEqual([expect.objectContaining({ status: 'changed' })]);
+    expect((await persistedCounts(store)).snapshots).toBe(2);
+    expect(await store.pendingCandidatesForSource(input.monitorId, source.id)).toHaveLength(1);
+    expect(
+      (await store.client.execute({ sql: 'SELECT * FROM snapshots WHERE id = ?', args: [baseline.id] })).rows[0],
+    ).toEqual(originalRow);
+    for (const incompatible of [
+      { ...source, contentSelector: 'main' },
+      { ...source, ignoreSelectors: ['table'] },
+      { ...source, minContentChars: (source.minContentChars ?? 180) + 1 },
+      { ...source, url: 'https://public.example/rebound' },
+    ]) {
+      const rejected = await runPage('$29', { ...input, sources: [incompatible] });
+      expect(rejected.sources[0]).toMatchObject({ status: 'failed', error: { code: 'SOURCE_ID_REBOUND' } });
+    }
+    for (const [index, invalidProfile] of [
+      JSON.stringify({ ...JSON.parse(profile), version: 'x9-semantic-v1' }),
+      JSON.stringify({ ...JSON.parse(profile), version: 'prefix-x9-semantic-v2' }),
+      JSON.stringify({ ...JSON.parse(profile), futureOption: true }),
+      '{malformed',
+      'null',
+      '[]',
+    ].entries()) {
+      const invalidInput = { ...input, monitorId: `incompatible-profile-${index}` };
+      const run = await store.beginRun(invalidInput.monitorId);
+      await store.persistAcceptedSnapshot({
+        runId: run.id,
+        monitorId: invalidInput.monitorId,
+        sourceId: source.id,
+        sourceUrl: source.url,
+        normalizationProfile: invalidProfile,
+        content: historical,
+        evidence: [],
+        promoteBaseline: true,
+      });
+      await store.finishRun(run, 'success', {});
+      const rejected = await runPage('$19', invalidInput);
+      expect(rejected.sources[0]).toMatchObject({ status: 'failed', error: { code: 'SOURCE_ID_REBOUND' } });
+    }
+  });
+
   it('preserves and rejects a v1 normalization profile without silently changing its baseline', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'competitor-monitor-normalization-'));
     const url = `file:${join(directory, 'monitor.db')}`;
@@ -240,7 +441,7 @@ describe('native workflow and durable application store', () => {
       sourceId: 'pricing-page',
       sourceUrl: 'https://public.example/pricing',
       normalizationProfile: JSON.stringify({
-        version: 'f1-semantic-v1',
+        version: 'x9-semantic-v1',
         contentSelector: undefined,
         ignoreSelectors: [],
       }),
@@ -552,14 +753,13 @@ describe('native workflow and durable application store', () => {
     await reopened.finishRun(recovered, 'success', {});
   });
 
-  it('does not reserve provider budget when the registered classifier is absent', async () => {
+  it('retains pending evidence when the registered classifier is absent', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'competitor-monitor-missing-classifier-'));
     const config = loadConfig({
       MONITOR_DATABASE_URL: `file:${join(directory, 'monitor.db')}`,
       MASTRA_DATABASE_URL: `file:${join(directory, 'mastra.db')}`,
       TYPESAFE_AI_API_KEY: 'synthetic-key',
       JEV_MODEL: 'jev-fixture',
-      JEV_COST_ATTESTATION: 'typesafe-jev-2026-09-27:jev-fixture',
     });
     const store = MonitorStore.open(config.storage.monitorUrl);
     stores.push(store);
@@ -568,7 +768,7 @@ describe('native workflow and durable application store', () => {
     expect(changed.changes).toEqual([
       expect.objectContaining({ status: 'failed', reason: 'CLASSIFICATION_PROVIDER_FAILURE' }),
     ]);
-    expect(await store.reservedProviderUsd('jev')).toBe(0);
+    expect(await store.pendingCandidatesForSource('monitor-a', 'pricing-page')).toHaveLength(1);
   });
 
   it('adds optional acquisition metadata without rewriting an existing snapshot JSON record', async () => {

@@ -2,11 +2,13 @@
 export const SOURCE_LIMITS = {
   // Sources/run; hard ceiling. MAX_SOURCES accepts integers from 1 to this value.
   maxSources: 20,
+  // Example limit per monitor/run. Developers can raise MAX_SOURCES up to maxSources.
+  defaultMaxSources: 3,
   // Source tasks in parallel; starter seed. SOURCE_CONCURRENCY accepts 1..maxConcurrency.
   defaultConcurrency: 3,
   // Concurrent source tasks; hard ceiling to bound outbound fan-out.
   maxConcurrency: 5,
-  // Evaluations/source in parallel; fixed at one to preserve order and bound reservations.
+  // Evaluations/source in parallel; fixed at one to preserve deterministic processing order.
   candidateConcurrency: 1,
   // Candidates/run/source; seed. CANDIDATES_PER_SOURCE accepts 1..maxCandidatesPerSource.
   defaultCandidatesPerSource: 20,
